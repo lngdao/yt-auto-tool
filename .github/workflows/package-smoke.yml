@@ -55,6 +55,7 @@ jobs:
         shell: bash
         run: |
           test "$(uname -m)" = "arm64"
+          brew update
           brew install ffmpeg tesseract dylibbundler
           echo "YOUTUBE_BATCH_FFMPEG=$(brew --prefix ffmpeg)/bin/ffmpeg" >> "$GITHUB_ENV"
           echo "YOUTUBE_BATCH_FFPROBE=$(brew --prefix ffmpeg)/bin/ffprobe" >> "$GITHUB_ENV"
