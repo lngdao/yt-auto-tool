@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import stat
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -25,7 +26,26 @@ def fetch_bytes(url: str) -> bytes:
 
 
 def fetch_json(url: str) -> dict:
-    return json.loads(fetch_bytes(url))
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        details = error.read().decode("utf-8", errors="replace").strip()
+        if error.code == 403:
+            hint = " Provide GH_TOKEN to authenticate GitHub API requests and avoid the anonymous rate limit."
+        else:
+            hint = ""
+        suffix = f" Response: {details[:500]}" if details else ""
+        raise SystemExit(f"GitHub release metadata request failed ({error.code}) for {url}.{hint}{suffix}") from error
 
 
 def download_verified_asset(repository: str, version: str, asset_name: str, destination: Path) -> tuple[str, str]:

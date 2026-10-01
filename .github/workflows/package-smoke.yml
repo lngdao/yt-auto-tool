@@ -81,6 +81,8 @@ jobs:
       - name: Stage pinned toolchain and build worker on Windows
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           & worker/.venv/Scripts/python.exe scripts/fetch_tool_releases.py
           & worker/.venv/Scripts/python.exe scripts/stage_tools.py
@@ -90,6 +92,8 @@ jobs:
       - name: Stage pinned toolchain and build worker on macOS
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           source worker/.venv/bin/activate
           python scripts/fetch_tool_releases.py
