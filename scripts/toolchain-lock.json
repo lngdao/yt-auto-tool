@@ -1,0 +1,21 @@
+{
+  "ffmpeg": {
+    "version": "9.0.2",
+    "encoders": ["libx264", "aac"],
+    "filters": ["subtitles"]
+  },
+  "yt_dlp": {
+    "version": "2026.08.19",
+    "repository": "yt-dlp/yt-dlp"
+  },
+  "deno": {
+    "version": "2.9.7",
+    "repository": "denoland/deno"
+  },
+  "tesseract": {
+    "version": "5.5.3",
+    "languages": ["eng", "vie"],
+    "traineddata_repository": "tesseract-ocr/tessdata_fast",
+    "traineddata_revision": "87416418657359cb625c412a48b6e1d6d41c29bd"
+  }
+}

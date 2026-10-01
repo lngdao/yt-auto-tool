@@ -1,0 +1,125 @@
+name: Desktop package smoke
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  package-smoke:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            target: windows-x64
+          - name: macOS Apple Silicon
+            os: macos-latest
+            target: macos-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Confirm target architecture and provision Windows tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") { throw "Windows package runner must be x64." }
+          choco install ffmpeg-full --version=9.0.2 --yes --no-progress
+          choco install tesseract --version=5.5.3.20260724 --yes --no-progress
+          choco install nsis --yes --no-progress
+          $ffmpegBin = (Get-ChildItem "$env:ChocolateyInstall\lib\ffmpeg-full\tools" -Filter ffmpeg.exe -Recurse | Select-Object -First 1).DirectoryName
+          $tesseract = (Get-ChildItem "$env:ProgramFiles\Tesseract-OCR" -Filter tesseract.exe -Recurse | Select-Object -First 1).FullName
+          if (-not $ffmpegBin -or -not $tesseract) { throw "Could not locate the pinned FFmpeg or Tesseract installation." }
+          "YOUTUBE_BATCH_FFMPEG=$ffmpegBin\ffmpeg.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "YOUTUBE_BATCH_FFPROBE=$ffmpegBin\ffprobe.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "YOUTUBE_BATCH_TESSERACT=$tesseract" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "YOUTUBE_BATCH_TESSERACT_RUNTIME=$((Split-Path $tesseract))" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Confirm target architecture and provision macOS tools
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          test "$(uname -m)" = "arm64"
+          brew install ffmpeg tesseract dylibbundler
+          echo "YOUTUBE_BATCH_FFMPEG=$(brew --prefix ffmpeg)/bin/ffmpeg" >> "$GITHUB_ENV"
+          echo "YOUTUBE_BATCH_FFPROBE=$(brew --prefix ffmpeg)/bin/ffprobe" >> "$GITHUB_ENV"
+          echo "YOUTUBE_BATCH_TESSERACT=$(brew --prefix tesseract)/bin/tesseract" >> "$GITHUB_ENV"
+          echo "YOUTUBE_BATCH_TESSERACT_RUNTIME=$(brew --prefix tesseract)" >> "$GITHUB_ENV"
+
+      - name: Install Python worker build dependencies on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          py -3.12 -m venv worker/.venv
+          & worker/.venv/Scripts/python.exe -m pip install --upgrade pip
+          & worker/.venv/Scripts/python.exe -m pip install -r worker/requirements-build.txt
+
+      - name: Install Python worker build dependencies on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          python -m venv worker/.venv
+          source worker/.venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r worker/requirements-build.txt
+
+      - name: Stage pinned toolchain and build worker on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & worker/.venv/Scripts/python.exe scripts/fetch_tool_releases.py
+          & worker/.venv/Scripts/python.exe scripts/stage_tools.py
+          & worker/.venv/Scripts/python.exe scripts/build_worker.py
+          & worker/.venv/Scripts/python.exe scripts/smoke_package.py
+
+      - name: Stage pinned toolchain and build worker on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          source worker/.venv/bin/activate
+          python scripts/fetch_tool_releases.py
+          python scripts/stage_tools.py
+          python scripts/build_worker.py
+          python scripts/smoke_package.py
+
+      - name: Build Windows Tauri package
+        if: runner.os == 'Windows'
+        working-directory: desktop
+        shell: pwsh
+        run: |
+          npm ci
+          npm run build
+          npm run tauri -- build --bundles nsis
+
+      - name: Build macOS Tauri package
+        if: runner.os == 'macOS'
+        working-directory: desktop
+        shell: bash
+        run: |
+          npm ci
+          npm run build
+          npm run tauri -- build --bundles app,dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: youtube-video-batch-tool-${{ matrix.target }}
+          path: |
+            desktop/src-tauri/target/release/bundle/nsis/*.exe
+            desktop/src-tauri/target/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/release/bundle/macos/*.app
+          if-no-files-found: error
