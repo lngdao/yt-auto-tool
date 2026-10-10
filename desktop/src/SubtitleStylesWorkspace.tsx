@@ -4,7 +4,7 @@ import { Channel, SubtitleFontInfo, SubtitlePreset, SubtitleStyle, workerRequest
 import "./SubtitleStylesWorkspace.css";
 
 const DEFAULT_STYLE: SubtitleStyle = {
-  font_family: "Arial", font_size: 40, text_color: "#FFFFFF", background_enabled: true,
+  font_family: "Arial", bold: false, font_size: 40, text_color: "#FFFFFF", background_enabled: true,
   background_color: "#000000", background_opacity: 0.58, outline_color: "#000000",
   outline_width: 2, shadow: 1, alignment: "bottom-center", position_x: 50, position_y: 88,
 };
@@ -23,17 +23,30 @@ function Preview({ style, text, aspectRatio }: { style: SubtitleStyle; text: str
   const [vertical, horizontal] = style.alignment.split("-");
   const transformX = horizontal === "left" ? "0" : horizontal === "right" ? "-100%" : "-50%";
   const transformY = vertical === "top" ? "0" : vertical === "bottom" ? "-100%" : "-50%";
+  const [ratioWidth, ratioHeight] = aspectRatio.split("/").map((value) => Number(value.trim()));
+  const isLandscape = ratioWidth >= ratioHeight;
+  const referenceWidth = isLandscape ? Math.round(720 * ratioWidth / ratioHeight) : 720;
+  const referenceHeight = isLandscape ? 720 : Math.round(720 * ratioHeight / ratioWidth);
+  const scaledOutline = style.outline_width * 100 / referenceWidth;
+  const scaledShadow = style.shadow * 100 / referenceWidth;
+  const textAlign = horizontal === "left" ? "left" : horizontal === "right" ? "right" : "center";
+  const shadowColor = style.background_enabled
+    ? colorWithAlpha(style.background_color, style.background_opacity)
+    : style.outline_color;
   return <div className="caption-preview-stage">
     <div className="caption-preview-scene" style={{ aspectRatio }}><div className="caption-preview-horizon" /><div className="caption-preview-light" />
       <span className="caption-preview-text" style={{
         left: `${style.position_x}%`, top: `${style.position_y}%`, transform: `translate(${transformX}, ${transformY})`,
-        color: style.text_color, fontFamily: style.font_family, fontSize: `clamp(10px, ${style.font_size / 7.2}px, 30px)`,
+        color: style.text_color, fontFamily: style.font_family, fontSize: `${style.font_size * 100 / referenceWidth}cqw`, textAlign,
+        fontWeight: style.bold ? 700 : 400,
         backgroundColor: style.background_enabled ? colorWithAlpha(style.background_color, style.background_opacity) : "transparent",
-        WebkitTextStroke: `${Math.max(0.35, style.outline_width / 2.5)}px ${style.outline_color}`,
-        textShadow: style.shadow ? `0 ${style.shadow}px ${style.shadow * 1.6}px #000a` : "none",
+        padding: style.background_enabled ? `${scaledOutline}cqw` : 0,
+        borderRadius: 0,
+        WebkitTextStroke: !style.background_enabled && style.outline_width ? `${scaledOutline}cqw ${style.outline_color}` : "0cqw transparent",
+        textShadow: style.shadow ? `${scaledShadow}cqw ${scaledShadow}cqw 0 ${shadowColor}` : "none",
       }}>{text || "Your caption appears here"}</span>
     </div>
-    <div className="caption-preview-caption"><span>PREVIEW · 16:9 OUTPUT FRAME</span><small>Demo text can be replaced in a future preview update.</small></div>
+    <div className="caption-preview-caption"><span>PREVIEW · {referenceWidth}×{referenceHeight} REFERENCE</span><small>Pixel styles scale with this 720-based frame.</small></div>
   </div>;
 }
 
@@ -49,6 +62,8 @@ export default function SubtitleStylesWorkspace() {
   const [demoText, setDemoText] = useState("Your caption appears here");
   const [previewAspectRatio, setPreviewAspectRatio] = useState("16 / 9");
   const [fontInfo, setFontInfo] = useState<SubtitleFontInfo | null>(null);
+  const [installedFonts, setInstalledFonts] = useState<string[]>([]);
+  const [fontListWarning, setFontListWarning] = useState("");
   const [checkingFont, setCheckingFont] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -56,6 +71,11 @@ export default function SubtitleStylesWorkspace() {
 
   const channel = channels.find((item) => item.id === channelId) ?? null;
   const selected = presets.find((item) => item.id === presetId) ?? null;
+  const fontOptions = useMemo(() => {
+    const values = new Map(installedFonts.map((font) => [font.toLocaleLowerCase(), font]));
+    if (style.font_family.trim()) values.set(style.font_family.toLocaleLowerCase(), style.font_family);
+    return Array.from(values.values()).sort((left, right) => left.localeCompare(right));
+  }, [installedFonts, style.font_family]);
 
   async function loadChannels(preferredId?: string) {
     const next = await workerRequest<Channel[]>("channels.list");
@@ -79,6 +99,11 @@ export default function SubtitleStylesWorkspace() {
 
   useEffect(() => { void loadChannels().catch((caught) => setError(String(caught))); }, []);
   useEffect(() => {
+    void workerRequest<string[]>("subtitles.fonts.list")
+      .then(setInstalledFonts)
+      .catch((caught) => setFontListWarning(String(caught)));
+  }, []);
+  useEffect(() => {
     if (!channelId && scope === "channel") return;
     void loadPresets(scope, channelId).catch((caught) => setError(String(caught)));
     // Loading is intentionally tied to channel/scope changes. Preset selection is handled below.
@@ -87,6 +112,7 @@ export default function SubtitleStylesWorkspace() {
   useEffect(() => {
     let cancelled = false;
     setCheckingFont(true);
+    setFontInfo(null);
     const timer = window.setTimeout(() => {
       void workerRequest<SubtitleFontInfo>("subtitles.font.inspect", { font_family: style.font_family })
         .then((result) => { if (!cancelled) setFontInfo(result); })
@@ -149,11 +175,17 @@ export default function SubtitleStylesWorkspace() {
     finally { setBusy(false); }
   }
 
+  function resetStyle() {
+    setStyle({ ...DEFAULT_STYLE });
+    setMessage("Đã khôi phục thông số mặc định; nhấn Lưu thay đổi để áp dụng.");
+    setError("");
+  }
+
   const update = <K extends keyof SubtitleStyle>(key: K, value: SubtitleStyle[K]) => setStyle((current) => ({ ...current, [key]: value }));
   const channelDefaultLabel = useMemo(() => channel?.default_subtitle_preset?.name ?? "Built-in default", [channel]);
 
   return <section className="subtitle-styles-workspace">
-    <div className="subtitle-styles-heading"><div><span className="eyebrow">CAPTION DESIGN</span><h1>Kiểu phụ đề</h1><p>Tạo preset có thể tái sử dụng và xem nhanh trên khung 16:9 trước khi render.</p></div><button className="button button-primary" type="button" onClick={startNew}><Plus size={16} /> Preset mới</button></div>
+    <div className="subtitle-styles-heading"><div><span className="eyebrow">CAPTION DESIGN</span><h1>Kiểu phụ đề</h1><p>Tạo preset có thể tái sử dụng và xem thử nhiều tỷ lệ khung trước khi render.</p></div><button className="button button-primary" type="button" onClick={startNew}><Plus size={16} /> Preset mới</button></div>
     {error && <div className="style-alert error"><WarningCircle size={16} /><span>{error}</span></div>}
     {message && <div className="style-alert"><Check size={16} /><span>{message}</span></div>}
     <div className="subtitle-style-layout">
@@ -167,22 +199,23 @@ export default function SubtitleStylesWorkspace() {
         {scope === "channel" && channel && <div className="default-preset-note">Preset mặc định của <strong>{channel.name}</strong>: {channelDefaultLabel}{selected?.id === channel.default_subtitle_preset_id && <span> · đang chọn</span>}</div>}
         <label className="style-field">Tên preset<input value={name} onChange={(event) => setName(event.target.value)} maxLength={80} placeholder="Ví dụ: trắng viền đen" /></label>
         <div className="style-controls-grid">
-          <label className="style-field">Font<input value={style.font_family} onChange={(event) => update("font_family", event.target.value)} placeholder="Arial" />{checkingFont ? <small className="font-check-note">Đang kiểm tra font…</small> : fontInfo?.warning ? <small className="font-check-note warning" title={fontInfo.font_path ?? undefined}>{fontInfo.warning}</small> : fontInfo?.available ? <small className="font-check-note">Đã tìm thấy {fontInfo.matched_family}</small> : null}</label>
+          <label className="style-field">Font<select value={style.font_family} onChange={(event) => update("font_family", event.target.value)}>{fontOptions.map((font) => <option key={font} value={font}>{font}{fontInfo?.available === false && font.toLocaleLowerCase() === style.font_family.toLocaleLowerCase() ? " · không có trên máy" : ""}</option>)}</select>{fontListWarning ? <small className="font-check-note warning">Không tải được danh sách font hệ thống: {fontListWarning}</small> : checkingFont ? <small className="font-check-note">Đang kiểm tra font…</small> : fontInfo?.warning ? <small className="font-check-note warning" title={fontInfo.font_path ?? undefined}>{fontInfo.warning}</small> : fontInfo?.available ? <small className="font-check-note">Đã tìm thấy {fontInfo.matched_family}</small> : null}</label>
           <label className="style-field">Cỡ chữ <output>{style.font_size}px</output><input type="range" min="12" max="120" value={style.font_size} onChange={(event) => update("font_size", Number(event.target.value))} /></label>
+          <label className="style-check"><input type="checkbox" checked={Boolean(style.bold)} onChange={(event) => update("bold", event.target.checked)} /> In đậm</label>
           <label className="style-field color-control">Màu chữ<input type="color" value={style.text_color} onChange={(event) => update("text_color", event.target.value)} /><code>{style.text_color}</code></label>
           <label className="style-field color-control">Màu nền<input type="color" value={style.background_color} onChange={(event) => update("background_color", event.target.value)} /><code>{style.background_color}</code></label>
           <label className="style-field">Độ mờ nền <output>{Math.round(style.background_opacity * 100)}%</output><input type="range" min="0" max="100" value={Math.round(style.background_opacity * 100)} onChange={(event) => update("background_opacity", Number(event.target.value) / 100)} /></label>
           <label className="style-check"><input type="checkbox" checked={style.background_enabled} onChange={(event) => update("background_enabled", event.target.checked)} /> Hiện nền sau chữ</label>
-          <label className="style-field color-control">Màu viền<input type="color" value={style.outline_color} onChange={(event) => update("outline_color", event.target.value)} /><code>{style.outline_color}</code></label>
-          <label className="style-field">Độ dày viền <output>{style.outline_width}px</output><input type="range" min="0" max="12" step="0.5" value={style.outline_width} onChange={(event) => update("outline_width", Number(event.target.value))} /></label>
+          <label className="style-field color-control">Màu viền<input type="color" value={style.outline_color} onChange={(event) => update("outline_color", event.target.value)} disabled={style.background_enabled} /><code>{style.outline_color}</code><small className="font-check-note">{style.background_enabled ? "Tắt nền để dùng viền quanh chữ." : "Dùng làm viền chữ và màu bóng."}</small></label>
+          <label className="style-field">{style.background_enabled ? "Đệm hộp nền" : "Độ dày viền"} <output>{style.outline_width}px</output><input type="range" min="0" max="12" step="0.5" value={style.outline_width} onChange={(event) => update("outline_width", Number(event.target.value))} /></label>
           <label className="style-field">Bóng chữ <output>{style.shadow}px</output><input type="range" min="0" max="12" step="0.5" value={style.shadow} onChange={(event) => update("shadow", Number(event.target.value))} /></label>
           <label className="style-field">Căn chỉnh<select value={style.alignment} onChange={(event) => update("alignment", event.target.value as SubtitleStyle["alignment"])}>{ALIGNMENTS.map((alignment) => <option key={alignment} value={alignment}>{alignment.replace("-", " · ")}</option>)}</select></label>
           <label className="style-field">Vị trí ngang <output>{style.position_x}%</output><input type="range" min="0" max="100" value={style.position_x} onChange={(event) => update("position_x", Number(event.target.value))} /></label>
           <label className="style-field">Vị trí dọc <output>{style.position_y}%</output><input type="range" min="0" max="100" value={style.position_y} onChange={(event) => update("position_y", Number(event.target.value))} /></label>
         </div>
-        <div className="style-editor-actions"><button type="button" className="button button-secondary" onClick={() => void duplicate()} disabled={!selected || busy}><CopySimple size={15} /> Nhân bản</button>{scope === "channel" && <button type="button" className="button button-secondary" onClick={() => void setDefault()} disabled={!channel || !selected || busy}><Check size={15} /> Đặt mặc định</button>}<button type="button" className="button button-primary" onClick={() => void save()} disabled={busy || !name.trim()}><FloppyDisk size={15} /> {busy ? "Đang lưu…" : editingExisting ? "Lưu thay đổi" : "Tạo preset"}</button></div>
+        <div className="style-editor-actions"><button type="button" className="button button-secondary" onClick={resetStyle} disabled={busy}>Đặt lại thông số</button><button type="button" className="button button-secondary" onClick={() => void duplicate()} disabled={!selected || busy}><CopySimple size={15} /> Nhân bản</button>{scope === "channel" && <button type="button" className="button button-secondary" onClick={() => void setDefault()} disabled={!channel || !selected || busy}><Check size={15} /> Đặt mặc định</button>}<button type="button" className="button button-primary" onClick={() => void save()} disabled={busy || !name.trim()}><FloppyDisk size={15} /> {busy ? "Đang lưu…" : editingExisting ? "Lưu thay đổi" : "Tạo preset"}</button></div>
       </section>
-      <section className="style-preview-card"><div className="style-editor-top"><div><span className="eyebrow">XEM TRƯỚC</span><h2>Minh họa chữ phụ đề</h2></div><label className="preview-dimension-select"><span>Khung</span><select value={previewAspectRatio} onChange={(event) => setPreviewAspectRatio(event.target.value)}><option value="16 / 9">16:9</option><option value="9 / 16">9:16</option><option value="4 / 3">4:3</option><option value="1 / 1">1:1</option><option value="3 / 4">3:4</option></select></label></div><label className="style-field preview-demo-field">Chữ minh họa<input value={demoText} onChange={(event) => setDemoText(event.target.value)} maxLength={120} /></label><Preview style={style} text={demoText} aspectRatio={previewAspectRatio} /><div className="preview-footnote">Khung xem trước chỉ minh họa vị trí và kiểu chữ. Render cuối dùng font có trên máy.</div></section>
+      <section className="style-preview-card"><div className="style-editor-top"><div><span className="eyebrow">XEM TRƯỚC</span><h2>Minh họa chữ phụ đề</h2></div><label className="preview-dimension-select"><span>Khung</span><select value={previewAspectRatio} onChange={(event) => setPreviewAspectRatio(event.target.value)}><option value="16 / 9">16:9</option><option value="9 / 16">9:16</option><option value="4 / 3">4:3</option><option value="1 / 1">1:1</option><option value="3 / 4">3:4</option></select></label></div><label className="style-field preview-demo-field">Chữ minh họa<textarea rows={2} value={demoText} onChange={(event) => setDemoText(event.target.value)} maxLength={500} /></label><Preview style={style} text={demoText} aspectRatio={previewAspectRatio} /><div className="preview-footnote">Tâm của khối caption bám đúng anchor đã chọn. Preview dùng độ phân giải tham chiếu 720-based; nếu render ở độ phân giải khác, cỡ chữ theo pixel sẽ có tỷ lệ tương đối khác.</div></section>
     </div>
   </section>;
 }

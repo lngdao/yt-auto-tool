@@ -79,7 +79,7 @@ class WorkerApiBehaviorTests(unittest.TestCase):
             "    language = sys.argv[sys.argv.index('--sub-langs') + 1]\n"
             "    (destination / ('subtitle.' + language + '.vtt')).write_text('WEBVTT\\n\\n00:00:01.000 --> 00:00:02.000\\nhello\\n')\n"
             "else:\n"
-            "    extension = 'mp4' if '--merge-output-format' in sys.argv else 'webm'\n"
+            "    extension = 'mp4' if '--merge-output-format' in sys.argv else 'mp3'\n"
             "    fixture = os.environ.get('FAKE_SOURCE_FIXTURE')\n"
             "    if fixture:\n"
             "        import shutil\n"
@@ -727,6 +727,7 @@ class WorkerApiBehaviorTests(unittest.TestCase):
         self.assertEqual(downloaded["download_status"], "complete")
         self.assertFalse(downloaded["include_video_source"])
         self.assertTrue(Path(downloaded["source_audio_path"]).is_file())
+        self.assertEqual(Path(downloaded["source_audio_path"]).suffix, ".mp3")
         self.assertIsNone(downloaded["source_video_path"])
         self.assertTrue(Path(downloaded["source_thumbnail_path"]).is_file())
         self.assertEqual(downloaded["subtitle_decision"], "youtube")
@@ -736,6 +737,7 @@ class WorkerApiBehaviorTests(unittest.TestCase):
         media_command = next(command for command in commands if "--write-thumbnail" in command)
         subtitle_command = next(command for command in commands if "--write-subs" in command)
         self.assertEqual(media_command[media_command.index("-f") + 1], "bestaudio/best")
+        self.assertNotIn("--no-call-home", media_command)
         self.assertIn("--skip-download", subtitle_command)
         self.assertNotIn("--write-auto-subs", subtitle_command)
 
@@ -766,6 +768,7 @@ class WorkerApiBehaviorTests(unittest.TestCase):
                 "job_id": job["id"],
                 "output_dir": str(self.root / "full-video-output"),
                 "include_video_source": True,
+                "max_video_height": 720,
             },
             env={"YTDLP_BINARY": str(self.metadata_tool()), "YTDLP_ARGS_LOG": str(argument_log)},
         )["result"]
@@ -776,7 +779,7 @@ class WorkerApiBehaviorTests(unittest.TestCase):
         self.assertEqual(Path(downloaded["source_video_path"]).suffix, ".mp4")
         commands = [json.loads(line) for line in argument_log.read_text().splitlines()]
         video_command = next(command for command in commands if "--merge-output-format" in command)
-        self.assertEqual(video_command[video_command.index("-f") + 1], "bestvideo+bestaudio/best")
+        self.assertEqual(video_command[video_command.index("-f") + 1], "bestvideo[height<=720]+bestaudio/best[height<=720]")
 
     def test_render_inspection_detects_aspect_ratio_mismatch_and_stores_resolution(self) -> None:
         background, _ = self.make_ffmpeg_fixtures(width=90, height=160)
@@ -911,7 +914,7 @@ class WorkerApiBehaviorTests(unittest.TestCase):
     def test_subtitle_presets_can_be_created_duplicated_and_applied(self) -> None:
         channel = self.request("channels.create", {"name": "Kênh Preset"})["result"]
         style = {
-            "font_family": "Arial", "font_size": 40, "text_color": "#FFF2A8",
+            "font_family": "Arial", "bold": True, "font_size": 40, "text_color": "#FFF2A8",
             "background_enabled": True, "background_color": "#101820", "background_opacity": 0.65,
             "outline_color": "#000000", "outline_width": 2, "shadow": 1,
             "alignment": "bottom-center", "position_x": 50, "position_y": 88,
@@ -938,8 +941,62 @@ class WorkerApiBehaviorTests(unittest.TestCase):
         applied = self.request("jobs.set_subtitle_preset", {"job_id": confirmed["jobs"][0]["id"], "preset_id": duplicate["id"]})["result"]
 
         self.assertEqual(updated["style"]["font_size"], 46)
+        self.assertTrue(updated["style"]["bold"])
         self.assertEqual(applied["subtitle_style"]["font_size"], 46)
         self.assertEqual(self.request("subtitles.presets.list", {"channel_id": channel["id"]})["result"][0]["id"], duplicate["id"])
+
+    def test_subtitle_font_catalog_is_sorted_and_unique(self) -> None:
+        from worker import worker as worker_module
+
+        fonts = worker_module.list_installed_subtitle_fonts()
+
+        self.assertEqual(fonts, sorted(set(fonts), key=str.casefold))
+        self.assertTrue(all(isinstance(font, str) and font for font in fonts))
+
+    def test_ass_caption_wraps_long_lines_and_keeps_middle_center_anchor(self) -> None:
+        from worker import worker as worker_module
+
+        source = self.root / "center-caption.srt"
+        destination = self.root / "center-caption.ass"
+        source.write_text("1\n00:00:00,000 --> 00:00:02,000\nA long caption that should wrap and remain aligned around its center point.\n")
+        style = {
+            **worker_module.DEFAULT_SUBTITLE_STYLE,
+            "alignment": "middle-center",
+            "position_x": 50,
+            "position_y": 50,
+            "bold": True,
+        }
+
+        worker_module.write_ass_subtitle(source, destination, style, {"width": 1280, "height": 720})
+        ass = destination.read_text(encoding="utf-8")
+
+        self.assertIn("WrapStyle: 0", ass)
+        self.assertIn(r"{\an5\pos(640,360)}", ass)
+        style_line = next(line for line in ass.splitlines() if line.startswith("Style: Default,"))
+        self.assertEqual(style_line.split(",")[7], "-1")
+        self.assertEqual(style_line.split(",")[19:21], ["77", "77"])
+
+    def test_media_probe_decodes_ffprobe_json_as_utf8(self) -> None:
+        from unittest.mock import patch
+
+        from worker import worker as worker_module
+
+        command = ["ffprobe", "-of", "json", "D:/YT/nền/background.mp4"]
+        probe_output = '{"streams": [], "format": {"filename": "D:/YT/nền/background.mp4"}}'
+        completed = subprocess.CompletedProcess(command, 0, probe_output, "")
+        with patch.dict(worker_module.os.environ, {"FFPROBE_BINARY": "ffprobe"}), \
+                patch.object(worker_module.subprocess, "run", return_value=completed) as run:
+            result = worker_module.media_probe("D:/YT/nền/background.mp4")
+
+        self.assertEqual(result["format"]["filename"], "D:/YT/nền/background.mp4")
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(run.call_args.kwargs["errors"], "replace")
+
+    def test_subtitle_style_defaults_to_regular_font_and_supports_bold(self) -> None:
+        from worker import worker as worker_module
+
+        self.assertFalse(worker_module.validate_subtitle_style({})["bold"])
+        self.assertTrue(worker_module.validate_subtitle_style({"bold": True})["bold"])
 
     def test_thumbnail_queue_runs_without_video_audio_and_resumes_after_text_review(self) -> None:
         from PIL import Image
@@ -1048,6 +1105,505 @@ class WorkerApiBehaviorTests(unittest.TestCase):
         self.assertEqual(final_job["render_status"], "complete")
         self.assertTrue(Path(final_job["output_video_path"]).is_file())
 
+    def test_queued_queue_task_can_be_removed_without_removing_its_job(self) -> None:
+        channel = self.request("channels.create", {"name": "Remove queued task"})["result"]
+        imported = self.request("batches.import_text", {
+            "name": "Queued task removal",
+            "channel_id": channel["id"],
+            "content": "https://youtu.be/removequeued",
+        })["result"]
+        batch = imported["batch"]
+        job = imported["jobs"][0]
+        task_id = "queued-task-to-remove"
+        created_at = datetime.now().isoformat()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "INSERT INTO queue_tasks(id, batch_id, job_id, pipeline, state, stage, progress, output_root, created_at, updated_at) VALUES (?, ?, ?, 'video', 'queued', 'queued', 0, ?, ?, ?)",
+                (task_id, batch["id"], job["id"], str(self.root / "queued-output"), created_at, created_at),
+            )
+            connection.execute(
+                "INSERT INTO queue_task_logs(id, task_id, level, message, created_at) VALUES (?, ?, 'info', 'queued', ?)",
+                ("queued-task-log", task_id, created_at),
+            )
+            connection.commit()
+        connection.close()
+
+        removed = self.request("queue.remove", {"task_id": task_id})["result"]
+        self.assertEqual(removed["removed"], 1)
+        self.assertEqual(removed["job_id"], job["id"])
+        with sqlite3.connect(self.database) as connection:
+            self.assertIsNone(connection.execute("SELECT id FROM queue_tasks WHERE id = ?", (task_id,)).fetchone())
+            self.assertIsNone(connection.execute("SELECT id FROM queue_task_logs WHERE task_id = ?", (task_id,)).fetchone())
+        self.assertIsNotNone(connection.execute("SELECT id FROM video_jobs WHERE id = ?", (job["id"],)).fetchone())
+        connection.close()
+
+    def test_batch_delete_removes_history_but_keeps_downloaded_files(self) -> None:
+        channel = self.request("channels.create", {"name": "Delete batch"})["result"]
+        imported = self.request("batches.import_text", {
+            "name": "Batch to delete",
+            "channel_id": channel["id"],
+            "workflow_mode": "download_only",
+            "content": "https://youtu.be/deletebatch1",
+        })["result"]
+        batch_id = imported["batch"]["id"]
+        job_id = imported["jobs"][0]["id"]
+        output_file = self.root / "saved-output" / "source.mp4"
+        output_file.parent.mkdir()
+        output_file.write_bytes(b"saved video")
+        created_at = datetime.now().isoformat()
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "INSERT INTO queue_tasks(id, batch_id, job_id, pipeline, state, stage, progress, output_root, created_at, updated_at, completed_at) VALUES (?, ?, ?, 'download_only', 'complete', 'packaging', 1, ?, ?, ?, ?)",
+            ("completed-delete-task", batch_id, job_id, str(output_file.parent), created_at, created_at, created_at),
+        )
+        connection.execute(
+            "INSERT INTO queue_task_logs(id, task_id, level, message, created_at) VALUES (?, ?, 'info', 'complete', ?)",
+            ("completed-delete-log", "completed-delete-task", created_at),
+        )
+        connection.execute(
+            "INSERT INTO job_artifacts(id, job_id, kind, path, created_at) VALUES (?, ?, 'source_video', ?, ?)",
+            ("delete-batch-artifact", job_id, str(output_file), created_at),
+        )
+        connection.commit()
+        connection.close()
+
+        deleted = self.request("batches.delete", {"batch_id": batch_id})["result"]
+        self.assertTrue(deleted["deleted"])
+        self.assertTrue(deleted["files_kept"])
+        self.assertTrue(output_file.is_file())
+        with sqlite3.connect(self.database) as connection:
+            self.assertIsNone(connection.execute("SELECT id FROM batches WHERE id = ?", (batch_id,)).fetchone())
+            self.assertIsNone(connection.execute("SELECT id FROM video_jobs WHERE id = ?", (job_id,)).fetchone())
+            self.assertIsNone(connection.execute("SELECT id FROM queue_tasks WHERE id = ?", ("completed-delete-task",)).fetchone())
+            self.assertIsNone(connection.execute("SELECT id FROM queue_task_logs WHERE id = ?", ("completed-delete-log",)).fetchone())
+            self.assertIsNone(connection.execute("SELECT id FROM job_artifacts WHERE id = ?", ("delete-batch-artifact",)).fetchone())
+        connection.close()
+
+    def test_batch_delete_rejects_active_jobs(self) -> None:
+        channel = self.request("channels.create", {"name": "Active batch"})["result"]
+        imported = self.request("batches.import_text", {
+            "name": "Active batch to keep",
+            "channel_id": channel["id"],
+            "content": "https://youtu.be/activebatch1",
+        })["result"]
+        batch_id = imported["batch"]["id"]
+        job_id = imported["jobs"][0]["id"]
+        created_at = datetime.now().isoformat()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "INSERT INTO queue_tasks(id, batch_id, job_id, pipeline, state, stage, progress, output_root, created_at, updated_at) VALUES (?, ?, ?, 'video', 'downloading', 'downloading', 0.4, ?, ?, ?)",
+                ("active-delete-task", batch_id, job_id, str(self.root / "active-output"), created_at, created_at),
+            )
+            connection.commit()
+        connection.close()
+
+        response = self.request("batches.delete", {"batch_id": batch_id})
+        self.assertFalse(response["ok"])
+        self.assertIn("active jobs", response["error"]["message"])
+        with sqlite3.connect(self.database) as connection:
+            self.assertIsNotNone(connection.execute("SELECT id FROM batches WHERE id = ?", (batch_id,)).fetchone())
+        connection.close()
+
+    def test_download_only_folders_use_channel_name_and_video_import_order(self) -> None:
+        from worker import worker as worker_module
+
+        channel = self.request("channels.create", {"name": "Kênh 1"})["result"]
+        imported = self.request("batches.import_text", {
+            "name": "Folder order",
+            "channel_id": channel["id"],
+            "workflow_mode": "download_only",
+            "content": "https://youtu.be/11111111111\nhttps://youtu.be/22222222222",
+        })["result"]
+        connection = worker_module.open_database(str(self.database))
+        jobs = connection.execute(
+            "SELECT * FROM video_jobs WHERE batch_id = ? ORDER BY position",
+            (imported["batch"]["id"],),
+        ).fetchall()
+        directories = [
+            worker_module.job_download_directory(connection, job, str(self.root / "ordered-output"))
+            for job in jobs
+        ]
+        connection.close()
+
+        self.assertEqual([directory.name for directory in directories], ["video 1", "video 2"])
+        self.assertEqual([directory.parent.name for directory in directories], ["Kênh 1", "Kênh 1"])
+        self.assertTrue(all(directory.parent.parent == (self.root / "ordered-output").resolve() for directory in directories))
+
+    def test_download_only_audio_package_saves_video_title(self) -> None:
+        from worker import worker as worker_module
+
+        channel = self.request("channels.create", {"name": "Audio package title"})["result"]
+        imported = self.request("batches.import_text", {
+            "name": "Audio package title",
+            "channel_id": channel["id"],
+            "workflow_mode": "download_only",
+            "content": "https://youtu.be/titlepackage1",
+        })["result"]
+        job = imported["jobs"][0]
+        package = self.root / "audio-output" / "Audio package title" / "video 1"
+        package.mkdir(parents=True)
+        audio = package / "source.m4a"
+        thumbnail = package / "source.jpg"
+        audio.write_bytes(b"audio")
+        thumbnail.write_bytes(b"thumbnail")
+        connection = worker_module.open_database(str(self.database))
+        connection.execute(
+            "UPDATE video_jobs SET metadata_status = 'ready', title = ?, subtitle_decision = 'skip', source_audio_path = ?, source_video_path = NULL, source_thumbnail_path = ? WHERE id = ?",
+            ("Morning focus — música", str(audio), str(thumbnail), job["id"]),
+        )
+        connection.commit()
+
+        worker_module.prepare_download_only_package(connection, {
+            "job_id": job["id"],
+            "include_video_source": 0,
+        })
+        connection.close()
+
+        title_file = package / "title.txt"
+        self.assertEqual(title_file.read_text(encoding="utf-8"), "Morning focus — música\n")
+        with sqlite3.connect(self.database) as connection:
+            artifact = connection.execute(
+                "SELECT path FROM job_artifacts WHERE job_id = ? AND kind = 'video_title'",
+                (job["id"],),
+            ).fetchone()
+        connection.close()
+        self.assertEqual(artifact[0], str(title_file))
+
+    def test_download_only_media_choice_and_resolution_build_ytdlp_formats(self) -> None:
+        from unittest.mock import patch
+
+        from worker import worker as worker_module
+
+        channel = self.request("channels.create", {"name": "Download format options"})["result"]
+        imported = self.request("batches.import_text", {
+            "name": "Download format options",
+            "channel_id": channel["id"],
+            "workflow_mode": "download_only",
+            "content": "https://youtu.be/videoid0001\nhttps://youtu.be/audioid0001",
+        })["result"]
+        connection = worker_module.open_database(str(self.database))
+        connection.execute(
+            "UPDATE batches SET state = 'confirmed', confirmed_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), imported["batch"]["id"]),
+        )
+        connection.execute(
+            "UPDATE video_jobs SET metadata_status = 'ready', title = CASE position WHEN 0 THEN 'Video title' ELSE 'Audio title' END, subtitle_decision = 'skip' WHERE batch_id = ?",
+            (imported["batch"]["id"],),
+        )
+        connection.commit()
+        jobs = connection.execute(
+            "SELECT * FROM video_jobs WHERE batch_id = ? ORDER BY position",
+            (imported["batch"]["id"],),
+        ).fetchall()
+        commands = []
+
+        def fake_run_ytdlp(command, **kwargs):
+            commands.append(command)
+            template = command[command.index("--output") + 1]
+            extension = command[command.index("--merge-output-format") + 1] if "--merge-output-format" in command else "mp3"
+            Path(template.replace("%(ext)s", extension)).write_bytes(b"media")
+            if "--write-thumbnail" in command:
+                Path(template.replace("%(ext)s", "jpg")).write_bytes(b"thumbnail")
+
+        output_root = self.root / "format-output"
+        output_root.mkdir()
+        with patch.object(worker_module, "run_ytdlp", side_effect=fake_run_ytdlp), \
+                patch.dict(worker_module.os.environ, {"YTDLP_BINARY": "fake-yt-dlp"}):
+            video = worker_module.download_job_sources(
+                connection, imported["batch"]["id"], jobs[0]["id"], str(output_root),
+                True, download_only=True, max_video_height=720,
+            )
+            audio = worker_module.download_job_sources(
+                connection, imported["batch"]["id"], jobs[1]["id"], str(output_root),
+                False, download_only=True,
+            )
+            for job in jobs:
+                worker_module.prepare_download_only_package(connection, {
+                    "job_id": job["id"],
+                    "include_video_source": int(job["position"] == 0),
+                })
+        connection.close()
+
+        video_command = next(command for command in commands if "--merge-output-format" in command)
+        audio_command = next(command for command in commands if "--merge-output-format" not in command)
+        self.assertEqual(video_command[video_command.index("-f") + 1], "bestvideo[height<=720]+bestaudio/best[height<=720]")
+        self.assertEqual(audio_command[audio_command.index("-f") + 1], "bestaudio")
+        self.assertNotIn("--no-call-home", video_command)
+        self.assertNotIn("--no-call-home", audio_command)
+        self.assertEqual(video["download_status"], "complete")
+        self.assertEqual(audio["download_status"], "complete")
+        self.assertTrue(Path(video["source_video_path"]).is_file())
+        self.assertTrue(Path(audio["source_audio_path"]).is_file())
+        self.assertTrue((Path(video["source_video_path"]).parent / "title.txt").is_file())
+        self.assertTrue((Path(audio["source_audio_path"]).parent / "title.txt").is_file())
+
+    def test_youtube_karaoke_vtt_is_normalized_without_inline_timestamps_or_rollup_duplicates(self) -> None:
+        from worker import worker as worker_module
+
+        source = self.root / "youtube-captions.vtt"
+        destination = self.root / "captions.srt"
+        source.write_text(
+            "WEBVTT\n\n"
+            "00:00:00.000 --> 00:00:00.050\n"
+            "Hello <00:00:00.200><c>world</c>\n\n"
+            "00:00:00.050 --> 00:00:02.000\n"
+            "Hello <00:00:00.200><c>world </c><00:00:00.700><c>from </c>"
+            "<00:00:01.200><c>YouTube.</c>\n\n"
+            "00:00:02.000 --> 00:00:02.050\n"
+            "world from YouTube.\n\n"
+            "00:00:02.050 --> 00:00:03.500\n"
+            "world from YouTube. This is <00:00:02.700><c>clean.</c>\n",
+            encoding="utf-8",
+        )
+
+        worker_module.normalize_subtitle_to_srt(str(source), destination)
+        normalized = destination.read_text(encoding="utf-8")
+
+        self.assertEqual(normalized.count("Hello world from YouTube."), 1)
+        self.assertIn("This is clean.", normalized)
+        self.assertNotIn("<00:", normalized)
+        self.assertNotIn("<c>", normalized)
+        self.assertIn("00:00:03,500", normalized)
+
+    def test_karaoke_caption_groups_do_not_split_into_instantaneous_cues(self) -> None:
+        import re
+
+        from worker import worker as worker_module
+
+        source = self.root / "same-start-words.vtt"
+        destination = self.root / "grouped-caption.srt"
+        source.write_text(
+            "WEBVTT\n\n"
+            "00:00:00.000 --> 00:00:03.000\n"
+            "Get ready <00:00:00.100><c>what comes next will shift </c>"
+            "<00:00:00.100><c>everything you thought you knew... </c>"
+            "<00:00:01.500><c>another section begins here.</c>\n",
+            encoding="utf-8",
+        )
+
+        worker_module.normalize_subtitle_to_srt(str(source), destination)
+        blocks = re.split(r"\n\s*\n", destination.read_text(encoding="utf-8").strip())
+        timings = [
+            re.search(r"(\d{2}:\d{2}:\d{2}),(\d{3}) --> (\d{2}:\d{2}:\d{2}),(\d{3})", block)
+            for block in blocks
+        ]
+        durations = []
+        for match in filter(None, timings):
+            start = sum(float(part) * factor for part, factor in zip(match.group(1).split(":"), (3600, 60, 1))) + int(match.group(2)) / 1000
+            end = sum(float(part) * factor for part, factor in zip(match.group(3).split(":"), (3600, 60, 1))) + int(match.group(4)) / 1000
+            durations.append(end - start)
+
+        self.assertEqual(len(durations), 2)
+        self.assertTrue(all(duration >= 1.2 for duration in durations))
+
+    def test_audio_only_webm_source_converts_to_premiere_compatible_mp3(self) -> None:
+        from unittest.mock import patch
+
+        from worker import worker as worker_module
+
+        source = self.root / "source.webm"
+        source.write_bytes(b"opus source")
+        probe_results = [
+            {"streams": [{"codec_type": "audio", "codec_name": "opus"}]},
+            {"streams": [{"codec_type": "audio", "codec_name": "mp3"}]},
+        ]
+        commands = []
+
+        def fake_ffmpeg(command, **kwargs):
+            commands.append(command)
+            Path(command[-1]).write_bytes(b"mp3 source")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch.object(worker_module, "media_probe", side_effect=probe_results), \
+                patch.dict(worker_module.os.environ, {"FFMPEG_BINARY": "ffmpeg"}), \
+                patch.object(worker_module.subprocess, "run", side_effect=fake_ffmpeg):
+            converted = worker_module.ensure_premiere_compatible_audio(source)
+
+        self.assertEqual(converted, source.with_suffix(".mp3"))
+        self.assertTrue(source.is_file())
+        self.assertEqual(converted.read_bytes(), b"mp3 source")
+        self.assertIn("libmp3lame", commands[0])
+        self.assertIn("192k", commands[0])
+        self.assertIn("-vn", commands[0])
+
+    def test_subtitle_downloads_are_paced_and_retried(self) -> None:
+        from unittest.mock import patch
+
+        from worker import worker as worker_module
+
+        channel = self.request("channels.create", {"name": "Subtitle pacing"})["result"]
+        self.request("channels.set_subtitle_languages", {"channel_id": channel["id"], "languages": ["en"]})
+        imported = self.request("batches.import_text", {
+            "name": "Subtitle pacing",
+            "channel_id": channel["id"],
+            "workflow_mode": "download_only",
+            "content": "https://youtu.be/subtitlepace1",
+        })["result"]
+        job = imported["jobs"][0]
+        connection = worker_module.open_database(str(self.database))
+        connection.execute(
+            "UPDATE batches SET state = 'confirmed', confirmed_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), imported["batch"]["id"]),
+        )
+        connection.execute(
+            "UPDATE video_jobs SET metadata_status = 'ready', title = 'Subtitle pacing video', subtitle_tracks_json = ? WHERE id = ?",
+            (json.dumps({"creator": [{"language": "en", "formats": "vtt", "label": ""}], "automatic": []}), job["id"]),
+        )
+        connection.commit()
+        commands = []
+        subtitle_attempts = 0
+
+        def fake_run_ytdlp(command, **kwargs):
+            nonlocal subtitle_attempts
+            commands.append(command)
+            template = Path(command[command.index("--output") + 1])
+            if "--skip-download" in command:
+                subtitle_attempts += 1
+                if subtitle_attempts == 1:
+                    raise ValueError("HTTP Error 429: Too Many Requests")
+                template.with_name("subtitle.en.vtt").write_text("WEBVTT\n\n", encoding="utf-8")
+            else:
+                template.with_name("source.mp4").write_bytes(b"video")
+                template.with_name("source.jpg").write_bytes(b"thumbnail")
+
+        output_root = self.root / "subtitle-pacing-output"
+        output_root.mkdir()
+        with patch.object(worker_module, "run_ytdlp", side_effect=fake_run_ytdlp), \
+                patch.object(worker_module, "YOUTUBE_SUBTITLE_MIN_GAP_SECONDS", 0), \
+                patch.dict(worker_module.os.environ, {"YTDLP_BINARY": "fake-yt-dlp"}):
+            failed = worker_module.download_job_sources(
+                connection, imported["batch"]["id"], job["id"], str(output_root),
+                True, download_only=True,
+            )
+            downloaded = worker_module.download_job_sources(
+                connection, imported["batch"]["id"], job["id"], str(output_root),
+                True, download_only=True,
+            )
+        connection.close()
+
+        subtitle_command = next(command for command in commands if "--skip-download" in command)
+        media_commands = [command for command in commands if "--merge-output-format" in command]
+        self.assertEqual(failed["download_status"], "error")
+        self.assertIn("rate-limiting", failed["download_error"])
+        self.assertEqual(downloaded["download_status"], "complete")
+        self.assertEqual(len(media_commands), 1)
+        self.assertEqual(subtitle_command[subtitle_command.index("--sleep-requests") + 1], "1")
+        self.assertEqual(subtitle_command[subtitle_command.index("--sleep-subtitles") + 1], "2")
+        self.assertEqual(subtitle_command[subtitle_command.index("--retry-sleep") + 1], "http:exp=5:30")
+        self.assertNotIn("--no-call-home", subtitle_command)
+
+    def test_output_directory_settings_and_batch_override_are_persisted(self) -> None:
+        channel = self.request("channels.create", {"name": "Output settings"})["result"]
+        imported = self.request("batches.import_text", {
+            "name": "Output root batch",
+            "channel_id": channel["id"],
+            "content": "https://youtu.be/outputroot01",
+        })["result"]
+        default_root = self.root / "default-output"
+        batch_root = self.root / "batch-output"
+        default_root.mkdir()
+        batch_root.mkdir()
+
+        configured = self.request("settings.output_directory.set", {"path": str(default_root)})["result"]
+        self.assertEqual(configured["path"], str(default_root.resolve()))
+        self.assertTrue(configured["available"])
+        batch = self.request("batches.set_output_root", {
+            "batch_id": imported["batch"]["id"],
+            "path": str(batch_root),
+        })["result"]
+        self.assertEqual(batch["output_root"], str(batch_root.resolve()))
+        reset = self.request("batches.set_output_root", {
+            "batch_id": imported["batch"]["id"],
+            "path": None,
+        })["result"]
+        self.assertIsNone(reset["output_root"])
+        cleared = self.request("settings.output_directory.set", {"path": None})["result"]
+        self.assertFalse(cleared["configured"])
+
+    def test_queue_allocates_ordered_video_folders_for_mixed_channels(self) -> None:
+        from unittest.mock import patch
+
+        from worker import worker as worker_module
+
+        first_channel = self.request("channels.create", {"name": "Queue Channel A"})["result"]
+        second_channel = self.request("channels.create", {"name": "Queue Channel B"})["result"]
+        imported = self.request("batches.import_text", {
+            "name": "Mixed channel batch",
+            "workflow_mode": "download_only",
+            "content": (
+                f"Channel,URL\n{first_channel['name']},https://youtu.be/firstchan01\n"
+                f"{second_channel['name']},https://youtu.be/secondchan1\n"
+                f"{first_channel['name']},https://youtu.be/firstchan02"
+            ),
+        })["result"]
+        output_root = self.root / "multi-channel-output"
+        output_root.mkdir()
+        connection = worker_module.open_database(str(self.database))
+        connection.execute(
+            "UPDATE batches SET state = 'confirmed', confirmed_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), imported["batch"]["id"]),
+        )
+        connection.execute(
+            "UPDATE video_jobs SET metadata_status = 'ready', title = video_id, subtitle_decision = 'skip' WHERE batch_id = ?",
+            (imported["batch"]["id"],),
+        )
+        connection.commit()
+        selected_ids = [job["id"] for job in reversed(imported["jobs"])]
+        with patch.object(worker_module, "launch_queue_worker", return_value=False):
+            queued = worker_module.start_queue_tasks(connection, str(self.database), {
+                "batch_id": imported["batch"]["id"],
+                "job_ids": selected_ids,
+                "output_root": str(output_root),
+                "pipeline": "download_only",
+                "include_video_source": True,
+                "max_video_height": 720,
+            })
+        channel_names = {channel["id"]: channel["name"] for channel in (first_channel, second_channel)}
+        job_channels = {job["id"]: job["channel_id"] for job in imported["jobs"]}
+        folders = {
+            job_channels[task["job_id"]]: task["output_folder_name"]
+            for task in queued["tasks"]
+            if task["pipeline"] == "download_only"
+        }
+        first_channel_folders = [
+            task["output_folder_name"]
+            for task in queued["tasks"]
+            if task["pipeline"] == "download_only" and job_channels[task["job_id"]] == first_channel["id"]
+        ]
+        self.assertTrue(all(task["include_video_source"] for task in queued["tasks"]))
+        self.assertTrue(all(task["max_video_height"] == 720 for task in queued["tasks"]))
+        self.assertEqual(first_channel_folders, ["video 1", "video 2"])
+        self.assertEqual(folders[second_channel["id"]], "video 1")
+        self.assertEqual(channel_names[first_channel["id"]], "Queue Channel A")
+
+        next_batch = self.request("batches.import_text", {
+            "name": "Next mixed channel batch",
+            "workflow_mode": "download_only",
+            "content": f"Channel,URL\n{first_channel['name']},https://youtu.be/thirdvideo01",
+        })["result"]
+        connection.execute(
+            "UPDATE batches SET state = 'confirmed', confirmed_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), next_batch["batch"]["id"]),
+        )
+        connection.execute(
+            "UPDATE video_jobs SET metadata_status = 'ready', title = video_id, subtitle_decision = 'skip' WHERE batch_id = ?",
+            (next_batch["batch"]["id"],),
+        )
+        connection.commit()
+        with patch.object(worker_module, "launch_queue_worker", return_value=False):
+            next_queued = worker_module.start_queue_tasks(connection, str(self.database), {
+                "batch_id": next_batch["batch"]["id"],
+                "job_ids": [next_batch["jobs"][0]["id"]],
+                "output_root": str(output_root),
+                "pipeline": "download_only",
+                "include_video_source": False,
+                "max_video_height": None,
+            })
+        connection.close()
+        self.assertEqual(next_queued["tasks"][0]["output_folder_name"], "video 3")
+        self.assertFalse(next_queued["tasks"][0]["include_video_source"])
+        self.assertIsNone(next_queued["tasks"][0]["max_video_height"])
+
     def test_queue_status_marks_work_interrupted_after_a_stale_worker_heartbeat(self) -> None:
         _, batch, job = self.create_confirmed_job("recover1234", [])
         task_id = "stale-queue-task"
@@ -1067,6 +1623,41 @@ class WorkerApiBehaviorTests(unittest.TestCase):
         self.assertEqual(task["state"], "interrupted")
         self.assertIn("heartbeat", task["error"].lower())
         self.assertEqual(final_job["render_status"], "interrupted")
+
+    def test_queue_worker_refreshes_heartbeat_without_batch_polling(self) -> None:
+        from worker import worker as worker_module
+
+        channel = self.request("channels.create", {"name": "Queue worker heartbeat"})["result"]
+        imported = self.request("batches.import_text", {
+            "name": "Queue worker heartbeat",
+            "channel_id": channel["id"],
+            "content": "https://youtu.be/workerheartbeat",
+        })["result"]
+        task_id = "heartbeat-test-task"
+        stale_time = "2000-01-01T00:00:00+00:00"
+        connection = worker_module.open_database(str(self.database))
+        connection.execute(
+            "INSERT INTO queue_tasks(id, batch_id, job_id, pipeline, state, stage, progress, output_root, created_at, updated_at) VALUES (?, ?, ?, 'video', 'downloading', 'downloading', 0.2, ?, ?, ?)",
+            (task_id, imported["batch"]["id"], imported["jobs"][0]["id"], str(self.root / "heartbeat-output"), stale_time, stale_time),
+        )
+        connection.execute(
+            "UPDATE queue_runtime SET state = 'running', token = ?, pid = NULL, heartbeat_at = ?, updated_at = ? WHERE id = 1",
+            ("heartbeat-test-token", stale_time, stale_time),
+        )
+        connection.commit()
+        worker_module.queue_worker_heartbeat(connection, "heartbeat-test-token")
+        heartbeat = worker_module.queue_heartbeat(connection)
+        task = connection.execute("SELECT state FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+        connection.close()
+
+        self.assertEqual(heartbeat["state"], "running")
+        self.assertEqual(task["state"], "downloading")
+
+    def test_process_is_alive_checks_current_windows_process(self) -> None:
+        from worker import worker as worker_module
+
+        self.assertTrue(worker_module.process_is_alive(os.getpid()))
+        self.assertFalse(worker_module.process_is_alive(2**31 - 1))
 
     def test_queue_concurrency_setting_is_persisted_and_runs_two_independent_thumbnail_jobs(self) -> None:
         from PIL import Image

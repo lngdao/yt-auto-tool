@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { CheckCircle, CircleNotch, FolderOpen, ShieldWarning, WarningCircle } from "@phosphor-icons/react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { DynamicToolchainState, LocalToolchainState, YoutubeCookieSettings, workerRequest } from "./worker";
+import { DynamicToolchainState, LocalToolchainState, OutputDirectorySettings, YoutubeCookieSettings, workerRequest } from "./worker";
 
 type Props = { localTools: LocalToolchainState; dynamicTools: DynamicToolchainState };
 
@@ -11,6 +11,7 @@ function fileName(path: string) {
 
 export default function SettingsWorkspace({ localTools, dynamicTools }: Props) {
   const [cookies, setCookies] = useState<YoutubeCookieSettings | null>(null);
+  const [outputDirectory, setOutputDirectory] = useState<OutputDirectorySettings | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -18,11 +19,41 @@ export default function SettingsWorkspace({ localTools, dynamicTools }: Props) {
     setCookies(await workerRequest<YoutubeCookieSettings>("settings.youtube_cookies.get"));
   }
 
+  async function refreshOutputDirectory() {
+    setOutputDirectory(await workerRequest<OutputDirectorySettings>("settings.output_directory.get"));
+  }
+
   useEffect(() => {
     void refreshCookies().catch((caught) => setError(String(caught)));
-    // Load the saved local path once when Settings opens.
+    void refreshOutputDirectory().catch((caught) => setError(String(caught)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  async function chooseOutputDirectory() {
+    setError(null);
+    try {
+      const path = await open({ directory: true, multiple: false, title: "Choose the default output folder" });
+      if (typeof path !== "string") return;
+      setBusy(true);
+      setOutputDirectory(await workerRequest<OutputDirectorySettings>("settings.output_directory.set", { path }));
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clearOutputDirectory() {
+    setBusy(true);
+    setError(null);
+    try {
+      setOutputDirectory(await workerRequest<OutputDirectorySettings>("settings.output_directory.set", { path: null }));
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function chooseCookies() {
     setError(null);
@@ -69,11 +100,37 @@ export default function SettingsWorkspace({ localTools, dynamicTools }: Props) {
         <div>
           <div className="eyebrow page-kicker">LOCAL APP CONFIGURATION</div>
           <h1>Settings</h1>
-          <p className="heading-description">Manage YouTube access and check the tools used by the workspace.</p>
+          <p className="heading-description">Set output defaults, manage YouTube access, and check workspace tools.</p>
         </div>
       </div>
 
       {error && <div className="error-banner"><WarningCircle size={18} /><span>{error}</span></div>}
+
+      <section className="settings-section">
+        <div className="settings-section-heading">
+          <div><h2>Default output folder</h2><p>Used for new batches unless a batch has its own folder. All videos in a batch share this root.</p></div>
+          <span className={`settings-status ${outputDirectory?.configured && outputDirectory.available ? "is-ready" : outputDirectory?.configured ? "is-warning" : ""}`}>
+            {outputDirectory?.configured && outputDirectory.available ? <CheckCircle size={14} /> : outputDirectory?.configured ? <WarningCircle size={14} /> : null}
+            {outputDirectory?.configured ? outputDirectory.available ? "Ready" : "Unavailable" : "Optional"}
+          </span>
+        </div>
+        <div className="cookie-setting-row">
+          <div className="cookie-file-icon"><FolderOpen size={19} /></div>
+          <div className="cookie-file-copy">
+            <strong>{outputDirectory?.configured ? fileName(outputDirectory.path ?? "") : "No default folder selected"}</strong>
+            <span title={outputDirectory?.path ?? undefined}>
+              {outputDirectory?.configured
+                ? outputDirectory.available ? outputDirectory.path : "This folder is not available. Choose another folder."
+                : "Choose a root such as D:\\YT. A batch can override it without changing this default."}
+            </span>
+          </div>
+          <button className="button button-secondary" type="button" onClick={() => void chooseOutputDirectory()} disabled={busy}>
+            {busy ? <CircleNotch className="spin" size={15} /> : <FolderOpen size={15} />}
+            {outputDirectory?.configured ? "Change folder" : "Choose folder"}
+          </button>
+          {outputDirectory?.configured && <button className="button button-quiet" type="button" onClick={() => void clearOutputDirectory()} disabled={busy}>Clear</button>}
+        </div>
+      </section>
 
       <section className="settings-section">
         <div className="settings-section-heading">

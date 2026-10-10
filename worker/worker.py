@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from functools import lru_cache
 import hashlib
 import html
 import json
@@ -29,10 +30,14 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 11
+YOUTUBE_SUBTITLE_DOWNLOAD_LOCK = threading.Lock()
+YOUTUBE_SUBTITLE_MIN_GAP_SECONDS = 5
+YOUTUBE_SUBTITLE_LAST_FINISHED_AT = 0.0
 
 DEFAULT_SUBTITLE_STYLE = {
     "font_family": "Arial",
+    "bold": False,
     "font_size": 40,
     "text_color": "#FFFFFF",
     "background_enabled": True,
@@ -75,6 +80,17 @@ def normalize_slug(value: str) -> str:
     ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", ascii_value).strip("-").lower()
     return slug or "channel"
+
+
+def safe_directory_component(value: str, fallback: str) -> str:
+    component = unicodedata.normalize("NFC", str(value)).strip()
+    component = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", component)
+    component = re.sub(r"\s+", " ", component).rstrip(" .")
+    if not component or component in {".", ".."}:
+        return fallback
+    if component.split(".", 1)[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{index}" for index in range(1, 10)), *(f"LPT{index}" for index in range(1, 10))}:
+        component = f"_{component}"
+    return component[:120].rstrip(" .") or fallback
 
 
 def open_database(database_path: str) -> sqlite3.Connection:
@@ -133,7 +149,8 @@ def open_database(database_path: str) -> sqlite3.Connection:
             import_source TEXT NOT NULL,
             created_at TEXT NOT NULL,
             confirmed_at TEXT,
-            thumbnail_mode_override TEXT
+            thumbnail_mode_override TEXT,
+            output_root TEXT
         );
 
         CREATE TABLE IF NOT EXISTS video_jobs (
@@ -145,6 +162,7 @@ def open_database(database_path: str) -> sqlite3.Connection:
             canonical_url TEXT,
             video_id TEXT,
             title TEXT,
+            video_language TEXT,
             duration_seconds REAL,
             thumbnail_url TEXT,
             metadata_status TEXT NOT NULL DEFAULT 'pending',
@@ -192,6 +210,8 @@ def open_database(database_path: str) -> sqlite3.Connection:
             stage TEXT NOT NULL,
             progress REAL NOT NULL DEFAULT 0,
             output_root TEXT NOT NULL,
+            output_folder_name TEXT,
+            max_video_height INTEGER,
             include_video_source INTEGER NOT NULL DEFAULT 0,
             error TEXT,
             cancel_requested INTEGER NOT NULL DEFAULT 0,
@@ -271,9 +291,11 @@ def open_database(database_path: str) -> sqlite3.Connection:
     ensure_database_column(connection, "channels", "default_thumbnail_preset_id", "TEXT")
     ensure_database_column(connection, "batches", "workflow_mode", "TEXT NOT NULL DEFAULT 'render'")
     ensure_database_column(connection, "batches", "thumbnail_mode_override", "TEXT")
+    ensure_database_column(connection, "batches", "output_root", "TEXT")
     for column, declaration in (
         ("subtitle_tracks_json", "TEXT NOT NULL DEFAULT '{\"creator\":[],\"automatic\":[]}'"),
         ("subtitle_language_override_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("video_language", "TEXT"),
         ("subtitle_language", "TEXT"),
         ("subtitle_source", "TEXT"),
         ("subtitle_decision", "TEXT NOT NULL DEFAULT 'unresolved'"),
@@ -313,6 +335,8 @@ def open_database(database_path: str) -> sqlite3.Connection:
         (utc_now(),),
     )
     ensure_database_column(connection, "queue_tasks", "pipeline", "TEXT NOT NULL DEFAULT 'video'")
+    ensure_database_column(connection, "queue_tasks", "output_folder_name", "TEXT")
+    ensure_database_column(connection, "queue_tasks", "max_video_height", "INTEGER")
     ensure_database_column(connection, "queue_runtime", "max_concurrency", "INTEGER NOT NULL DEFAULT 1")
     for row in connection.execute("SELECT id, name FROM channels WHERE default_subtitle_preset_id IS NULL").fetchall():
         preset = create_subtitle_preset(connection, row["id"], f"{row['name']} default", DEFAULT_SUBTITLE_STYLE)
@@ -391,13 +415,77 @@ def validate_subtitle_style(style: Any) -> dict[str, Any]:
     if value["alignment"] not in {"top-left", "top-center", "top-right", "middle-left", "middle-center", "middle-right", "bottom-left", "bottom-center", "bottom-right"}:
         raise ValueError("Choose one of the nine subtitle alignment positions.")
     value["background_enabled"] = bool(value["background_enabled"])
+    value["bold"] = bool(value["bold"])
     return value
+
+
+def subtitle_font_directories() -> list[Path]:
+    if sys.platform == "darwin":
+        return [Path("/System/Library/Fonts"), Path("/Library/Fonts"), Path.home() / "Library/Fonts"]
+    if os.name == "nt":
+        windir = os.environ.get("WINDIR", r"C:\Windows")
+        return [Path(windir) / "Fonts"]
+    return [Path.home() / ".fonts", Path("/usr/share/fonts"), Path("/usr/local/share/fonts")]
+
+
+@lru_cache(maxsize=1)
+def subtitle_font_catalog() -> tuple[tuple[str, str], ...]:
+    fonts: dict[str, tuple[str, str]] = {}
+    binary = shutil.which("fc-list")
+    if binary:
+        try:
+            completed = subprocess.run(
+                [binary, "--format", "%{family}\\t%{file}\\n"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            completed = None
+        if completed and completed.returncode == 0:
+            for line in completed.stdout.splitlines():
+                families, separator, path = line.partition("\t")
+                if not separator:
+                    continue
+                for family in families.split(","):
+                    name = family.strip()
+                    if name:
+                        fonts.setdefault(name.casefold(), (name, path.strip()))
+    if not fonts:
+        try:
+            from PIL import ImageFont
+        except ImportError:
+            ImageFont = None
+        if ImageFont is not None:
+            for directory in subtitle_font_directories():
+                if not directory.is_dir():
+                    continue
+                try:
+                    candidates = directory.rglob("*")
+                    for path in candidates:
+                        if path.suffix.lower() not in {".ttf", ".otf", ".ttc"}:
+                            continue
+                        try:
+                            family = ImageFont.truetype(str(path), 12).getname()[0].strip()
+                        except (OSError, ValueError):
+                            continue
+                        if family:
+                            fonts.setdefault(family.casefold(), (family, str(path)))
+                except OSError:
+                    continue
+    return tuple(sorted(fonts.values(), key=lambda item: item[0].casefold()))
+
+
+def list_installed_subtitle_fonts() -> list[str]:
+    return [family for family, _ in subtitle_font_catalog()]
 
 
 def inspect_font_family(font_family: str) -> dict[str, Any]:
     family = str(font_family).strip()
     if not family or len(family) > 80 or any(char in family for char in "{},\n\r"):
         raise ValueError("Enter a valid font family to check.")
+    catalog = {name.casefold(): path for name, path in subtitle_font_catalog()}
+    matching_path = catalog.get(family.casefold())
+    if matching_path:
+        return {"font_family": family, "available": True, "matched_family": family, "font_path": matching_path, "warning": None}
     binary = shutil.which("fc-match")
     if binary:
         try:
@@ -417,27 +505,8 @@ def inspect_font_family(font_family: str) -> dict[str, Any]:
                 "font_path": path.strip() or None,
                 "warning": None if available else f"{family} is not installed; the subtitle renderer will use {matched.strip() or 'a fallback font'}.",
             }
-    font_directories: list[Path] = []
-    if sys.platform == "darwin":
-        font_directories = [Path("/System/Library/Fonts"), Path("/Library/Fonts"), Path.home() / "Library/Fonts"]
-    elif os.name == "nt":
-        windir = os.environ.get("WINDIR", r"C:\Windows")
-        font_directories = [Path(windir) / "Fonts"]
-    else:
-        font_directories = [Path.home() / ".fonts", Path("/usr/share/fonts"), Path("/usr/local/share/fonts")]
-    expected = re.sub(r"[^a-z0-9]", "", family.casefold())
-    for directory in font_directories:
-        if not directory.is_dir():
-            continue
-        try:
-            candidates = directory.rglob("*")
-            for path in candidates:
-                if path.suffix.lower() in {".ttf", ".otf", ".ttc"}:
-                    stem = re.sub(r"[^a-z0-9]", "", path.stem.casefold())
-                    if stem == expected:
-                        return {"font_family": family, "available": True, "matched_family": family, "font_path": str(path), "warning": None}
-        except OSError:
-            continue
+    if catalog:
+        return {"font_family": family, "available": False, "matched_family": None, "font_path": None, "warning": f"{family} is not installed; the subtitle renderer will use a fallback font."}
     return {"font_family": family, "available": None, "matched_family": None, "font_path": None, "warning": "Could not verify this font on this platform; libass may substitute a system font during render."}
 
 
@@ -851,7 +920,7 @@ def download_source_thumbnail(
     else:
         raise ValueError("Choose an output folder to save the source thumbnail.")
     template = str(directory / "source.%(ext)s")
-    command = [binary, "--no-warnings", "--no-call-home", "--no-playlist", "--skip-download", "--output", template, "--write-thumbnail", "--convert-thumbnails", "jpg", job["canonical_url"]]
+    command = [binary, "--no-warnings", "--no-playlist", "--skip-download", "--output", template, "--write-thumbnail", "--convert-thumbnails", "jpg", job["canonical_url"]]
     if queue_task_id:
         queue_set_stage(connection, queue_task_id, "thumbnail_downloading", 0.05)
     run_ytdlp(command, connection=connection, queue_task_id=queue_task_id, progress_base=0.05, progress_span=0.55)
@@ -1715,6 +1784,7 @@ def batch_summary(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str,
         "id": row["id"],
         "name": row["name"],
         "workflow_mode": row["workflow_mode"],
+        "output_root": row["output_root"],
         "state": row["state"],
         "import_source": row["import_source"],
         "created_at": row["created_at"],
@@ -1806,7 +1876,7 @@ def job_view(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]
     active_preset = connection.execute("SELECT * FROM subtitle_presets WHERE id = ?", (active_preset_id,)).fetchone() if active_preset_id else None
     asset = connection.execute("SELECT * FROM media_assets WHERE id = ?", (row["background_asset_id"],)).fetchone() if row["background_asset_id"] else None
     channel_preferences = json.loads(channel["subtitle_languages_json"] or "[]") if row["channel_id"] else []
-    subtitle_preferences = json.loads(row["subtitle_language_override_json"] or "[]") or channel_preferences
+    subtitle_preferences = json.loads(row["subtitle_language_override_json"] or "[]") or channel_preferences or ([row["video_language"]] if row["video_language"] else [])
     subtitle_tracks = json.loads(row["subtitle_tracks_json"] or '{"creator":[],"automatic":[]}')
     selected_subtitle = select_subtitle_track(subtitle_preferences, subtitle_tracks)
     selected_thumbnail_preset_id = row["thumbnail_preset_id"] or (channel["default_thumbnail_preset_id"] if channel else None)
@@ -1862,6 +1932,7 @@ def job_view(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]
         "canonical_url": row["canonical_url"],
         "video_id": row["video_id"],
         "title": row["title"],
+        "video_language": row["video_language"],
         "duration_seconds": row["duration_seconds"],
         "thumbnail_url": row["thumbnail_url"],
         "metadata_status": row["metadata_status"],
@@ -1954,6 +2025,43 @@ def get_batch(connection: sqlite3.Connection, batch_id: str) -> dict[str, Any]:
     if row is None:
         raise ValueError("Batch was not found.")
     return {"batch": batch_summary(connection, row), "jobs": batch_jobs(connection, batch_id)}
+
+
+def set_batch_output_root(connection: sqlite3.Connection, batch_id: str, supplied_path: Any) -> dict[str, Any]:
+    batch = connection.execute("SELECT id FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    if batch is None:
+        raise ValueError("Batch was not found.")
+    path_value = str(supplied_path or "").strip()
+    output_root = None
+    if path_value:
+        path = Path(path_value).expanduser().resolve()
+        if not path.is_dir():
+            raise ValueError("Choose an existing output folder.")
+        output_root = str(path)
+    connection.execute("UPDATE batches SET output_root = ? WHERE id = ?", (output_root, batch_id))
+    connection.commit()
+    row = connection.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    return batch_summary(connection, row)
+
+
+def delete_batch(connection: sqlite3.Connection, batch_id: str) -> dict[str, Any]:
+    connection.execute("BEGIN IMMEDIATE")
+    batch = connection.execute("SELECT id FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    if batch is None:
+        raise ValueError("Batch was not found.")
+    active = connection.execute(
+        """
+        SELECT state FROM queue_tasks
+        WHERE batch_id = ? AND state IN ('starting', 'downloading', 'rendering', 'cancel_requested')
+        LIMIT 1
+        """,
+        (batch_id,),
+    ).fetchone()
+    if active:
+        raise ValueError("Cancel or finish this Batch's active jobs before deleting it.")
+    connection.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
+    connection.commit()
+    return {"deleted": True, "batch_id": batch_id, "files_kept": True}
 
 
 def refresh_duplicate_flags(connection: sqlite3.Connection, batch_id: str) -> None:
@@ -2174,7 +2282,7 @@ def lookup_metadata_for_batch(connection: sqlite3.Connection, batch_id: str) -> 
             )
             continue
         command = [
-            binary, "--no-warnings", "--no-call-home", "--skip-download",
+            binary, "--no-warnings", "--skip-download",
             "--no-playlist", "--dump-single-json", row["canonical_url"],
         ]
         try:
@@ -2187,11 +2295,13 @@ def lookup_metadata_for_batch(connection: sqlite3.Connection, batch_id: str) -> 
             if found_id != row["video_id"]:
                 raise ValueError("yt-dlp returned a different video ID than the imported URL.")
             duration = metadata.get("duration")
+            video_language = metadata.get("language") or metadata.get("original_language")
+            video_language = str(video_language).strip() if video_language else None
             subtitle_tracks = simplify_subtitle_tracks(metadata)
             connection.execute(
                 """
                 UPDATE video_jobs
-                SET video_id = ?, title = ?, duration_seconds = ?, thumbnail_url = ?,
+                SET video_id = ?, title = ?, video_language = ?, duration_seconds = ?, thumbnail_url = ?,
                     subtitle_tracks_json = ?,
                     metadata_status = 'ready', metadata_error = NULL
                 WHERE id = ?
@@ -2199,6 +2309,7 @@ def lookup_metadata_for_batch(connection: sqlite3.Connection, batch_id: str) -> 
                 (
                     found_id,
                     str(metadata.get("title") or "Untitled video"),
+                    video_language,
                     float(duration) if duration is not None else None,
                     metadata.get("thumbnail") or f"https://i.ytimg.com/vi/{found_id}/hqdefault.jpg",
                     json.dumps(subtitle_tracks, ensure_ascii=False),
@@ -2211,6 +2322,8 @@ def lookup_metadata_for_batch(connection: sqlite3.Connection, batch_id: str) -> 
                 (str(error)[-1000:], row["id"]),
             )
         connection.commit()
+        if connection.execute("SELECT metadata_status FROM video_jobs WHERE id = ?", (row["id"],)).fetchone()[0] == "ready":
+            resolve_job_subtitle(connection, row["id"])
     return batch_jobs(connection, batch_id)
 
 
@@ -2220,7 +2333,12 @@ def preferences_for_job(connection: sqlite3.Connection, job: sqlite3.Row) -> lis
         return override
     if job["channel_id"]:
         channel = ensure_channel(connection, job["channel_id"])
-        return json.loads(channel["subtitle_languages_json"] or "[]")
+        channel_preferences = json.loads(channel["subtitle_languages_json"] or "[]")
+        if channel_preferences:
+            return channel_preferences
+    video_language = str(job["video_language"] or "").strip()
+    if video_language:
+        return [video_language]
     return []
 
 
@@ -2372,6 +2490,7 @@ def job_download_directory(
     connection: sqlite3.Connection,
     job: sqlite3.Row,
     output_root: str,
+    output_folder_name: str | None = None,
 ) -> Path:
     batch = connection.execute("SELECT id, name, workflow_mode FROM batches WHERE id = ?", (job["batch_id"],)).fetchone()
     channel = ensure_channel(connection, job["channel_id"])
@@ -2379,20 +2498,30 @@ def job_download_directory(
     root.mkdir(parents=True, exist_ok=True)
     folder_name = job["id"]
     if batch["workflow_mode"] == "download_only":
-        title_slug = normalize_slug(str(job["title"] or job["video_id"] or "video"))[:80]
-        folder_name = f"{title_slug}-{job['video_id'] or job['id'][:8]}"
-    batch_folder = normalize_slug(batch["name"])
+        if output_folder_name:
+            folder_name = output_folder_name
+        else:
+            folder_name = f"video {download_only_position_in_channel(connection, job)}"
+    channel_folder = safe_directory_component(channel["name"], channel["id"][:8])
     if batch["workflow_mode"] == "download_only":
-        batch_folder = f"{batch_folder}-{batch['id'][:8]}"
-    directory = root.resolve() / batch_folder / channel["slug"] / folder_name
+        directory = root.resolve() / channel_folder / folder_name
+    else:
+        directory = root.resolve() / normalize_slug(batch["name"]) / channel_folder / folder_name
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def download_only_position_in_channel(connection: sqlite3.Connection, job: sqlite3.Row) -> int:
+    return int(connection.execute(
+        "SELECT COUNT(*) FROM video_jobs WHERE batch_id = ? AND channel_id = ? AND position <= ?",
+        (job["batch_id"], job["channel_id"], job["position"]),
+    ).fetchone()[0])
 
 
 class QueueCancelled(Exception):
     def __init__(self, state: str):
         self.state = state
-        super().__init__("Job cancelled by the user." if state == "cancelled" else "App heartbeat stopped; work was marked interrupted.")
+        super().__init__("Job cancelled by the user." if state == "cancelled" else "Queue worker stopped; work was marked interrupted.")
 
 
 def run_ytdlp(
@@ -2482,6 +2611,39 @@ def run_ytdlp(
         detail = completed.stderr.strip() or f"yt-dlp exited with code {completed.returncode}."
         raise ValueError(detail[-1200:])
     return completed
+
+
+def run_youtube_subtitle_ytdlp(
+    command: list[str],
+    connection: sqlite3.Connection | None = None,
+    queue_task_id: str | None = None,
+    progress_base: float = 0,
+    progress_span: float = 0.42,
+) -> subprocess.CompletedProcess[str]:
+    global YOUTUBE_SUBTITLE_LAST_FINISHED_AT
+    while not YOUTUBE_SUBTITLE_DOWNLOAD_LOCK.acquire(timeout=0.25):
+        abort_state = queue_abort_reason(connection, queue_task_id) if connection is not None and queue_task_id else None
+        if abort_state:
+            raise QueueCancelled(abort_state)
+    try:
+        while time.monotonic() - YOUTUBE_SUBTITLE_LAST_FINISHED_AT < YOUTUBE_SUBTITLE_MIN_GAP_SECONDS:
+            abort_state = queue_abort_reason(connection, queue_task_id) if connection is not None and queue_task_id else None
+            if abort_state:
+                raise QueueCancelled(abort_state)
+            time.sleep(0.25)
+        abort_state = queue_abort_reason(connection, queue_task_id) if connection is not None and queue_task_id else None
+        if abort_state:
+            raise QueueCancelled(abort_state)
+        return run_ytdlp(
+            command,
+            connection=connection,
+            queue_task_id=queue_task_id,
+            progress_base=progress_base,
+            progress_span=progress_span,
+        )
+    finally:
+        YOUTUBE_SUBTITLE_LAST_FINISHED_AT = time.monotonic()
+        YOUTUBE_SUBTITLE_DOWNLOAD_LOCK.release()
 
 
 def _application_tools_directory(database_path: str) -> Path:
@@ -2792,7 +2954,8 @@ def check_local_toolchain(database_path: str) -> dict[str, Any]:
     resource_root = os.environ.get("YOUTUBE_BATCH_RESOURCE_DIR")
     manifest = _read_json(Path(resource_root) / "manifest.json") if resource_root else None
     if resource_root and not manifest:
-        raise ValueError("The packaged tool manifest is missing or unreadable. Reinstall the app to restore its dependencies.")
+        manifest_path = Path(resource_root) / "manifest.json"
+        raise ValueError(f"The packaged tool manifest is missing or unreadable at {manifest_path}. Reinstall the app to restore its dependencies.")
     expected_versions = (manifest or {}).get("versions", {})
     actual_versions = {"ffmpeg": ffmpeg_version, "ffprobe": ffprobe_version, "tesseract": tesseract_version}
     for name, actual in actual_versions.items():
@@ -2807,7 +2970,13 @@ def check_local_toolchain(database_path: str) -> dict[str, Any]:
     required_languages = {"eng", "vie"} if os.environ.get("YOUTUBE_BATCH_RESOURCE_DIR") else {"eng"}
     missing_languages = required_languages - installed_languages
     if missing_languages:
-        raise ValueError(f"Tesseract is missing OCR model(s): {', '.join(sorted(missing_languages))}.")
+        tessdata_location = tessdata or "Tesseract's default data directory"
+        language_output = (languages.stderr or "").strip()
+        detail = f" Tesseract reported: {language_output}" if language_output else ""
+        raise ValueError(
+            f"Tesseract is missing OCR model(s): {', '.join(sorted(missing_languages))} "
+            f"in {tessdata_location} (exit code {languages.returncode}).{detail}"
+        )
     return {
         "ffmpeg": {"version": ffmpeg_version, "ready": True},
         "ffprobe": {"version": ffprobe_version, "ready": True},
@@ -2871,6 +3040,31 @@ def set_youtube_cookie_file(connection: sqlite3.Connection, raw_path: Any) -> di
     return youtube_cookie_settings(connection)
 
 
+def output_directory_settings(connection: sqlite3.Connection) -> dict[str, Any]:
+    row = connection.execute("SELECT value FROM app_meta WHERE key = 'default_output_root'").fetchone()
+    if row is None:
+        return {"path": None, "configured": False, "available": False}
+    path = Path(row["value"]).expanduser()
+    return {"path": str(path), "configured": True, "available": path.is_dir()}
+
+
+def set_output_directory_setting(connection: sqlite3.Connection, supplied_path: Any) -> dict[str, Any]:
+    path_value = str(supplied_path or "").strip()
+    if not path_value:
+        connection.execute("DELETE FROM app_meta WHERE key = 'default_output_root'")
+        connection.commit()
+        return output_directory_settings(connection)
+    path = Path(path_value).expanduser().resolve()
+    if not path.is_dir():
+        raise ValueError("Choose an existing output folder.")
+    connection.execute(
+        "INSERT INTO app_meta(key, value) VALUES ('default_output_root', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (str(path),),
+    )
+    connection.commit()
+    return output_directory_settings(connection)
+
+
 def prepare_ytdlp_command(command: list[str], connection: sqlite3.Connection | None = None) -> list[str]:
     deno = _tool_binary("DENO_BINARY", "deno")
     packaged_runtime = bool(os.environ.get("YOUTUBE_BATCH_RESOURCE_DIR"))
@@ -2902,6 +3096,8 @@ def download_job_sources(
     include_video: bool,
     queue_task_id: str | None = None,
     download_only: bool = False,
+    output_folder_name: str | None = None,
+    max_video_height: int | None = None,
 ) -> dict[str, Any]:
     batch = connection.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
     job = connection.execute(
@@ -2920,7 +3116,9 @@ def download_job_sources(
     binary = os.environ.get("YTDLP_BINARY") or shutil.which("yt-dlp") or shutil.which("yt_dlp")
     if not binary:
         raise ValueError("yt-dlp was not found. Install it or configure YTDLP_BINARY.")
-    directory = job_download_directory(connection, job, output_root)
+    if max_video_height is not None and max_video_height not in {360, 480, 720, 1080}:
+        raise ValueError("Maximum video resolution must be Best available, 1080p, 720p, 480p, or 360p.")
+    directory = job_download_directory(connection, job, output_root, output_folder_name)
     template = str(directory / "source.%(ext)s")
     include_video_value = 1 if include_video else 0
     connection.execute(
@@ -2929,23 +3127,42 @@ def download_job_sources(
     )
     connection.commit()
     thumbnail_mode = effective_thumbnail_mode(connection, job)
-    command = [binary, "--no-warnings", "--no-call-home", "--no-playlist", "--output", template]
+    command = [binary, "--no-warnings", "--no-playlist", "--output", template]
     if download_only or thumbnail_mode != "skip":
         command.extend(["--write-thumbnail", "--convert-thumbnails", "jpg"])
     if include_video:
-        command.extend(["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"])
+        selector = "bestvideo+bestaudio/best"
+        if max_video_height is not None:
+            selector = f"bestvideo[height<={max_video_height}]+bestaudio/best[height<={max_video_height}]"
+        command.extend(["-f", selector, "--merge-output-format", "mp4"])
     else:
-        command.extend(["-f", "bestaudio/best"])
+        command.extend(["-f", "bestaudio" if download_only else "bestaudio/best"])
     command.append(job["canonical_url"])
     try:
-        run_ytdlp(command, connection=connection, queue_task_id=queue_task_id)
-        files = [path for path in directory.glob("source.*") if path.is_file()]
-        thumbnails = [path for path in files if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
-        media_files = [path for path in files if path not in thumbnails]
-        media_file = next((path for path in media_files if path.suffix.lower() in {".mp4", ".m4v", ".mkv", ".webm", ".mov", ".m4a", ".mp3", ".opus", ".ogg", ".wav", ".aac", ".flac"}), None)
+        previous_media_path = Path((job["source_video_path"] if include_video else job["source_audio_path"]) or "")
+        previous_thumbnail_path = Path(job["source_thumbnail_path"] or "")
+        same_output_directory = previous_media_path.is_file() and previous_media_path.parent.resolve() == directory.resolve()
+        thumbnail_required = download_only or thumbnail_mode != "skip"
+        reusable_thumbnail = (
+            previous_thumbnail_path.is_file()
+            and previous_thumbnail_path.parent.resolve() == directory.resolve()
+        )
+        if same_output_directory and (not thumbnail_required or reusable_thumbnail):
+            media_file = previous_media_path
+            thumbnail_file = previous_thumbnail_path if reusable_thumbnail else None
+        else:
+            run_ytdlp(command, connection=connection, queue_task_id=queue_task_id)
+            files = [path for path in directory.glob("source.*") if path.is_file()]
+            thumbnails = [path for path in files if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
+            media_files = [path for path in files if path not in thumbnails]
+            media_file = next((path for path in media_files if path.suffix.lower() in {".mp4", ".m4v", ".mkv", ".webm", ".mov", ".m4a", ".mp3", ".opus", ".ogg", ".wav", ".aac", ".flac"}), None)
+            thumbnail_file = next(iter(thumbnails), None)
         if not media_file:
             raise ValueError("yt-dlp reported success but did not create a source media file.")
-        thumbnail_file = next(iter(thumbnails), None)
+        if not media_file:
+            raise ValueError("The saved source media file is missing.")
+        if not include_video:
+            media_file = ensure_premiere_compatible_audio(media_file)
         if thumbnail_mode != "skip" and not thumbnail_file:
             raise ValueError("yt-dlp downloaded the source media but did not save a thumbnail.")
         media_kind = "source_video" if include_video else "source_audio"
@@ -2956,6 +3173,8 @@ def download_job_sources(
             """,
             (None if include_video else str(media_file), str(media_file) if include_video else None, str(thumbnail_file) if thumbnail_file else None, job_id),
         )
+        if not include_video:
+            connection.execute("DELETE FROM job_artifacts WHERE job_id = ? AND kind = 'source_audio'", (job_id,))
         add_job_artifact(connection, job_id, media_kind, str(media_file))
         if thumbnail_file:
             add_job_artifact(connection, job_id, "source_thumbnail", str(thumbnail_file))
@@ -2980,14 +3199,24 @@ def download_job_sources(
         selection = resolution["selected"]
         if selection["source"] in {"creator", "automatic"}:
             subtitle_template = str(directory / "subtitle.%(ext)s")
-            subtitle_command = [binary, "--no-warnings", "--no-call-home", "--no-playlist", "--skip-download",
-                                "--output", subtitle_template, "--sub-langs", selection["language"],
-                                "--sub-format", "vtt/best"]
+            subtitle_command = [
+                binary, "--no-warnings", "--no-playlist", "--skip-download",
+                "--sleep-requests", "1", "--sleep-subtitles", "2",
+                "--retries", "3", "--retry-sleep", "http:exp=5:30",
+                "--output", subtitle_template, "--sub-langs", selection["language"],
+                "--sub-format", "vtt/best",
+            ]
             subtitle_command.append("--write-subs" if selection["source"] == "creator" else "--write-auto-subs")
             subtitle_command.append(job["canonical_url"])
             if queue_task_id:
                 queue_set_stage(connection, queue_task_id, "captions", 0.48)
-            run_ytdlp(subtitle_command, connection=connection, queue_task_id=queue_task_id, progress_base=0.48, progress_span=0.08)
+            run_youtube_subtitle_ytdlp(
+                subtitle_command,
+                connection=connection,
+                queue_task_id=queue_task_id,
+                progress_base=0.48,
+                progress_span=0.08,
+            )
             subtitle_files = [path for path in directory.glob("subtitle*") if path.is_file()]
             subtitle_file = next((path for path in subtitle_files if path.suffix.lower() in {".vtt", ".srt", ".ttml", ".srv3", ".json3"}), None)
             if not subtitle_file:
@@ -3008,9 +3237,14 @@ def download_job_sources(
             queue_update_progress(connection, queue_task_id, "waiting_for_captions" if status == "needs_subtitle_decision" else "downloading", 0.52 if status == "needs_subtitle_decision" else 0.55)
         connection.commit()
     except ValueError as error:
+        error_message = str(error)
+        if re.search(r"\b403\b", error_message):
+            error_message += " YouTube rejected this stream request. Retry with audio-only or a lower max resolution; if all options fail, the current YouTube session or PO-token requirements may need attention."
+        if re.search(r"\b429\b", error_message):
+            error_message += " YouTube is rate-limiting requests. Subtitle downloads are serialized and retried; if 429 continues, wait before retrying or refresh the YouTube session."
         connection.execute(
             "UPDATE video_jobs SET download_status = 'error', download_progress = NULL, download_error = ? WHERE id = ?",
-            (str(error)[-1200:], job_id),
+            (error_message[-1200:], job_id),
         )
         connection.commit()
     fresh = connection.execute("SELECT * FROM video_jobs WHERE id = ?", (job_id,)).fetchone()
@@ -3024,7 +3258,7 @@ def media_probe(path: str) -> dict[str, Any]:
     try:
         completed = subprocess.run(
             [binary, "-v", "error", "-show_streams", "-show_format", "-of", "json", path],
-            capture_output=True, text=True, check=False, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ValueError(f"ffprobe could not inspect the media file: {error}") from error
@@ -3034,6 +3268,45 @@ def media_probe(path: str) -> dict[str, Any]:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as error:
         raise ValueError("ffprobe returned invalid media information.") from error
+
+
+def ensure_premiere_compatible_audio(path: Path) -> Path:
+    if path.suffix.lower() == ".mp3":
+        return path
+    probe = media_probe(str(path))
+    audio_stream = next((stream for stream in probe.get("streams", []) if stream.get("codec_type") == "audio"), None)
+    if not audio_stream:
+        raise ValueError("The downloaded audio source has no audio stream.")
+    ffmpeg = os.environ.get("FFMPEG_BINARY") or shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise ValueError("FFmpeg was not found to convert audio-only sources to Premiere-compatible MP3.")
+    output_path = path.with_suffix(".mp3")
+    temporary_path = output_path.with_name(f".{output_path.stem}.{uuid.uuid4().hex}.partial.mp3")
+    command = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
+        "-map", "0:a:0", "-vn", "-map_metadata", "0", "-c:a", "libmp3lame", "-b:a", "192k",
+        str(temporary_path),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise ValueError(f"FFmpeg could not convert audio-only source to MP3: {error}") from error
+    if completed.returncode != 0:
+        temporary_path.unlink(missing_ok=True)
+        detail = completed.stderr.strip() or f"FFmpeg exited with code {completed.returncode}."
+        raise ValueError(f"Could not convert audio-only source to Premiere-compatible MP3: {detail[-800:]}")
+    try:
+        converted = media_probe(str(temporary_path))
+        converted_audio = next((stream for stream in converted.get("streams", []) if stream.get("codec_type") == "audio"), None)
+        if not converted_audio or converted_audio.get("codec_name") != "mp3":
+            raise ValueError("FFmpeg output does not contain the expected MP3 audio stream.")
+        os.replace(temporary_path, output_path)
+    except (OSError, ValueError) as error:
+        temporary_path.unlink(missing_ok=True)
+        if isinstance(error, ValueError):
+            raise
+        raise ValueError(f"Could not save the Premiere-compatible audio file: {error}") from error
+    return output_path
 
 
 def frame_from_media(path: str) -> dict[str, Any]:
@@ -3205,7 +3478,29 @@ def normalize_subtitle_to_srt(source_path: str, destination: Path) -> Path:
         raise ValueError(f"The selected subtitle file could not be read: {error}") from error
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
     blocks = re.split(r"\n\s*\n", raw.strip())
-    cues: list[tuple[str, str]] = []
+    time_pattern = r"((?:\d{2}:)?\d{2}:\d{2}[.,]\d{3})"
+    cue_pattern = re.compile(rf"\s*{time_pattern}\s+-->\s+{time_pattern}")
+    inline_time_pattern = re.compile(r"<((?:\d{2}:)?\d{2}:\d{2}[.,]\d{3})>")
+
+    def seconds(value: str) -> float:
+        parts = value.replace(",", ".").split(":")
+        if len(parts) == 2:
+            parts.insert(0, "00")
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+
+    def timestamp(value: float) -> str:
+        milliseconds = max(0, round(value * 1000))
+        hours, remainder = divmod(milliseconds, 3_600_000)
+        minutes, remainder = divmod(remainder, 60_000)
+        whole_seconds, milliseconds = divmod(remainder, 1000)
+        return f"{hours:02}:{minutes:02}:{whole_seconds:02},{milliseconds:03}"
+
+    def clean_text(value: str) -> str:
+        value = re.sub(r"(?i)<br\s*/?>", " ", value)
+        return html.unescape(re.sub(r"<[^>]*>", "", value)).strip()
+
+    parsed: list[tuple[float, float, str]] = []
+    has_inline_times = False
     for block in blocks:
         lines = block.splitlines()
         if not lines or lines[0].lstrip().startswith(("WEBVTT", "NOTE", "STYLE", "REGION")):
@@ -3213,17 +3508,80 @@ def normalize_subtitle_to_srt(source_path: str, destination: Path) -> Path:
         time_index = next((index for index, line in enumerate(lines) if "-->" in line), None)
         if time_index is None:
             continue
-        match = re.match(r"\s*((?:\d{2}:)?\d{2}:\d{2}[.,]\d{3})\s+-->\s+((?:\d{2}:)?\d{2}:\d{2}[.,]\d{3})", lines[time_index])
+        match = cue_pattern.match(lines[time_index])
         if not match:
             continue
-        def srt_time(value: str) -> str:
-            parts = value.replace(".", ",").split(":")
-            if len(parts) == 2:
-                parts.insert(0, "00")
-            return ":".join(parts)
-        text_lines = [html.unescape(line.strip()) for line in lines[time_index + 1:] if line.strip()]
-        if text_lines:
-            cues.append((f"{srt_time(match.group(1))} --> {srt_time(match.group(2))}", "\n".join(text_lines)))
+        start, end = seconds(match.group(1)), seconds(match.group(2))
+        body = "\n".join(lines[time_index + 1:])
+        has_inline_times = has_inline_times or bool(inline_time_pattern.search(body))
+        parsed.append((start, end, body))
+
+    cues: list[tuple[str, str]] = []
+    if has_inline_times:
+        word_events: list[tuple[float, float, str]] = []
+        transcript_keys: list[str] = []
+        first_cue_start = min((start for start, _, _ in parsed), default=0.0)
+        for cue_start, cue_end, body in parsed:
+            if cue_end - cue_start <= 0.08:
+                continue
+            pieces: list[tuple[float, str]] = []
+            cursor = 0
+            active_time = first_cue_start if not transcript_keys else cue_start
+            for marker in inline_time_pattern.finditer(body):
+                pieces.append((active_time, body[cursor:marker.start()]))
+                active_time = seconds(marker.group(1))
+                cursor = marker.end()
+            pieces.append((active_time, body[cursor:]))
+            current_words = [
+                (word, word_time)
+                for word_time, text in pieces
+                for word in clean_text(text).split()
+            ]
+            if not current_words:
+                continue
+            current_keys = [re.sub(r"[^\w']", "", word.casefold()) for word, _ in current_words]
+            overlap = 0
+            limit = min(len(transcript_keys), len(current_keys), 200)
+            for count in range(limit, 0, -1):
+                if transcript_keys[-count:] == current_keys[:count]:
+                    overlap = count
+                    break
+            new_words = current_words[overlap:]
+            word_events.extend((word_time, cue_end, word) for word, word_time in new_words)
+            transcript_keys.extend(current_keys[overlap:])
+
+        word_events.sort(key=lambda event: event[0])
+        groups: list[list[tuple[float, float, str]]] = []
+        current_group: list[tuple[float, float, str]] = []
+        for event in word_events:
+            candidate = " ".join([item[2] for item in current_group] + [event[2]])
+            elapsed = event[0] - current_group[0][0] if current_group else 0.0
+            sentence_ended = bool(current_group and re.search(r"[.!?][\"')\]]?$", current_group[-1][2]))
+            if current_group and (
+                (len(candidate) > 42 and elapsed >= 1.2)
+                or elapsed > 4.5
+                or (sentence_ended and elapsed >= 1.2)
+            ):
+                groups.append(current_group)
+                current_group = []
+            current_group.append(event)
+        if current_group:
+            groups.append(current_group)
+
+        for index, group in enumerate(groups):
+            start = group[0][0]
+            if index + 1 < len(groups):
+                end = groups[index + 1][0][0]
+            else:
+                end = max(start + 1.0, min(group[-1][1], start + 5.0))
+            if end <= start:
+                end = start + 0.1
+            cues.append((f"{timestamp(start)} --> {timestamp(end)}", " ".join(item[2] for item in group)))
+    else:
+        for start, end, body in parsed:
+            text_lines = [clean_text(line) for line in body.splitlines() if clean_text(line)]
+            if text_lines:
+                cues.append((f"{timestamp(start)} --> {timestamp(end)}", "\n".join(text_lines)))
     if not cues:
         raise ValueError("The chosen subtitle file does not contain any readable SRT/VTT captions.")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -3249,6 +3607,7 @@ def write_ass_subtitle(srt_path: Path, ass_path: Path, style: dict[str, Any], fr
     anchor = anchors[style["alignment"]]
     x = round(frame["width"] * style["position_x"] / 100)
     y = round(frame["height"] * style["position_y"] / 100)
+    horizontal_margin = round(frame["width"] * 0.06)
 
     def ass_timestamp(value: str) -> str:
         hours, minutes, seconds = value.replace(",", ".").split(":")
@@ -3283,13 +3642,16 @@ def write_ass_subtitle(srt_path: Path, ass_path: Path, style: dict[str, Any], fr
     if not cues:
         raise ValueError("Could not create render subtitles from the normalized SRT sidecar.")
     bold = -1 if style.get("bold", False) else 0
-    back_color = ass_color(style["background_color"], style["background_opacity"] if style["background_enabled"] else 0)
+    back_color = ass_color(
+        style["background_color"] if style["background_enabled"] else style["outline_color"],
+        style["background_opacity"] if style["background_enabled"] else 1,
+    )
     border_style = 3 if style["background_enabled"] else 1
     content = "\n".join([
         "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {frame['width']}", f"PlayResY: {frame['height']}",
-        "WrapStyle: 2", "ScaledBorderAndShadow: yes", "", "[V4+ Styles]",
+        "WrapStyle: 0", "ScaledBorderAndShadow: yes", "", "[V4+ Styles]",
         "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
-        f"Style: Default,{style['font_family']},{style['font_size']},{ass_color(style['text_color'])},&H000000FF,{ass_color(style['outline_color'])},{back_color},{bold},0,0,0,100,100,0,0,{border_style},{style['outline_width']},{style['shadow']},{anchor},0,0,0,1",
+        f"Style: Default,{style['font_family']},{style['font_size']},{ass_color(style['text_color'])},&H000000FF,{ass_color(style['outline_color'])},{back_color},{bold},0,0,0,100,100,0,0,{border_style},{style['outline_width']},{style['shadow']},{anchor},{horizontal_margin},{horizontal_margin},0,1",
         "", "[Events]", "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text", *cues, "",
     ])
     ass_path.write_text(content, encoding="utf-8")
@@ -3504,7 +3866,7 @@ def update_batch_job(
         """
         UPDATE video_jobs SET channel_id = ?, imported_channel_name = ?, url = ?,
             canonical_url = ?, video_id = ?, validation_code = ?, title = NULL,
-            duration_seconds = NULL, thumbnail_url = NULL, metadata_status = 'pending',
+            video_language = NULL, duration_seconds = NULL, thumbnail_url = NULL, metadata_status = 'pending',
             metadata_error = NULL, background_asset_id = NULL, background_locked = 0
         WHERE id = ?
         """,
@@ -3605,6 +3967,7 @@ def list_batches(connection: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 QUEUE_HEARTBEAT_TIMEOUT_SECONDS = 14
+QUEUE_WORKER_HEARTBEAT_INTERVAL_SECONDS = 2
 
 
 def queue_log(connection: sqlite3.Connection, task_id: str, message: str, level: str = "info") -> None:
@@ -3623,7 +3986,9 @@ def queue_task_view(connection: sqlite3.Connection, row: sqlite3.Row, include_lo
         "title": job["title"] if job else None, "video_id": job["video_id"] if job else None,
         "pipeline": row["pipeline"],
         "state": row["state"], "stage": row["stage"], "progress": row["progress"],
-        "output_root": row["output_root"], "include_video_source": bool(row["include_video_source"]),
+        "output_root": row["output_root"], "output_folder_name": row["output_folder_name"],
+        "max_video_height": row["max_video_height"],
+        "include_video_source": bool(row["include_video_source"]),
         "error": row["error"], "cancel_requested": bool(row["cancel_requested"]),
         "created_at": row["created_at"], "started_at": row["started_at"],
         "updated_at": row["updated_at"], "completed_at": row["completed_at"],
@@ -3642,6 +4007,27 @@ def queue_task_view(connection: sqlite3.Connection, row: sqlite3.Row, include_lo
 def process_is_alive(process_id: int | None) -> bool:
     if not process_id or process_id <= 0:
         return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        process_handle = kernel32.OpenProcess(0x1000, False, process_id)
+        if not process_handle:
+            return ctypes.get_last_error() == 5
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code)):
+                return ctypes.get_last_error() == 5
+            return exit_code.value == 259
+        finally:
+            kernel32.CloseHandle(process_handle)
     try:
         os.kill(process_id, 0)
         return True
@@ -3668,7 +4054,7 @@ def recover_queue_runtime(connection: sqlite3.Connection) -> None:
         return
     startup_stale = runtime["state"] == "starting" and queue_seconds_since(runtime["updated_at"]) > QUEUE_HEARTBEAT_TIMEOUT_SECONDS
     heartbeat_stale = queue_seconds_since(runtime["heartbeat_at"]) > QUEUE_HEARTBEAT_TIMEOUT_SECONDS
-    dead_worker = runtime["state"] == "running" and not process_is_alive(runtime["pid"])
+    dead_worker = runtime["state"] in {"starting", "running"} and runtime["pid"] is not None and not process_is_alive(runtime["pid"])
     if not (startup_stale or heartbeat_stale or dead_worker):
         return
     connection.execute("UPDATE queue_runtime SET state = 'stopping', updated_at = ? WHERE id = 1", (utc_now(),))
@@ -3678,7 +4064,7 @@ def recover_queue_runtime(connection: sqlite3.Connection) -> None:
     for task in running:
         connection.execute(
             "UPDATE queue_tasks SET state = 'interrupted', cancel_requested = 1, error = ?, completed_at = ?, updated_at = ? WHERE id = ?",
-            ("The app stopped sending queue heartbeats. Retry this job to continue from saved files.", utc_now(), utc_now(), task["id"]),
+            ("The queue worker heartbeat expired. Retry this job to continue from saved files.", utc_now(), utc_now(), task["id"]),
         )
         if task["pipeline"] == "thumbnail":
             connection.execute("UPDATE video_jobs SET thumbnail_ocr_status = 'interrupted', thumbnail_error = 'The app closed during thumbnail processing.', thumbnail_progress = NULL WHERE id = ?", (task["job_id"],))
@@ -3686,7 +4072,7 @@ def recover_queue_runtime(connection: sqlite3.Connection) -> None:
             connection.execute("UPDATE video_jobs SET render_status = 'interrupted', render_error = 'The app closed during rendering.', render_progress = NULL WHERE id = ?", (task["job_id"],))
         elif task["stage"] in {"downloading", "captions", "thumbnail_ocr"}:
             connection.execute("UPDATE video_jobs SET download_status = 'interrupted', download_error = 'The app closed during source download.', download_progress = NULL WHERE id = ?", (task["job_id"],))
-        queue_log(connection, task["id"], "Queue work was interrupted because the app heartbeat expired.", "warning")
+        queue_log(connection, task["id"], "Queue work was interrupted because the worker heartbeat expired.", "warning")
     if dead_worker or startup_stale:
         connection.execute("UPDATE queue_runtime SET state = 'stopped', pid = NULL, token = NULL, updated_at = ? WHERE id = 1", (utc_now(),))
     connection.commit()
@@ -3696,10 +4082,21 @@ def queue_heartbeat(connection: sqlite3.Connection) -> dict[str, Any]:
     recover_queue_runtime(connection)
     runtime = connection.execute("SELECT * FROM queue_runtime WHERE id = 1").fetchone()
     if runtime["state"] != "stopping":
-        connection.execute("UPDATE queue_runtime SET heartbeat_at = ?, updated_at = ? WHERE id = 1", (utc_now(), utc_now()))
+        if runtime["state"] == "starting":
+            connection.execute("UPDATE queue_runtime SET heartbeat_at = ? WHERE id = 1", (utc_now(),))
+        else:
+            connection.execute("UPDATE queue_runtime SET heartbeat_at = ?, updated_at = ? WHERE id = 1", (utc_now(), utc_now()))
         connection.commit()
     runtime = connection.execute("SELECT * FROM queue_runtime WHERE id = 1").fetchone()
     return {"state": runtime["state"], "worker_running": process_is_alive(runtime["pid"]), "heartbeat_at": runtime["heartbeat_at"]}
+
+
+def queue_worker_heartbeat(connection: sqlite3.Connection, token: str) -> None:
+    connection.execute(
+        "UPDATE queue_runtime SET heartbeat_at = ? WHERE id = 1 AND state = 'running' AND token = ?",
+        (utc_now(), token),
+    )
+    connection.commit()
 
 
 def queue_abort_reason(connection: sqlite3.Connection, task_id: str) -> str | None:
@@ -3777,6 +4174,68 @@ def latest_queue_task(connection: sqlite3.Connection, job_id: str, pipeline: str
     return connection.execute("SELECT * FROM queue_tasks WHERE job_id = ? AND pipeline = ? ORDER BY created_at DESC, id DESC LIMIT 1", (job_id, pipeline)).fetchone()
 
 
+def download_folder_path_key(output_root: str, channel_name: str, channel_id: str, folder_name: str) -> str:
+    directory = Path(output_root).expanduser().resolve() / safe_directory_component(channel_name, channel_id[:8]) / folder_name
+    return str(directory).casefold()
+
+
+def reserved_download_folder_paths(connection: sqlite3.Connection, output_root: str) -> set[str]:
+    rows = connection.execute(
+        """
+        SELECT queue_tasks.output_folder_name, video_jobs.channel_id, channels.name
+        FROM queue_tasks
+        JOIN video_jobs ON video_jobs.id = queue_tasks.job_id
+        JOIN channels ON channels.id = video_jobs.channel_id
+        WHERE queue_tasks.pipeline = 'download_only' AND queue_tasks.output_root = ?
+            AND queue_tasks.state IN ('queued', 'starting', 'downloading', 'rendering', 'cancel_requested', 'waiting_for_captions')
+        """,
+        (output_root,),
+    ).fetchall()
+    return {
+        download_folder_path_key(output_root, row["name"], row["channel_id"], row["output_folder_name"])
+        for row in rows
+        if row["output_folder_name"]
+    }
+
+
+def allocate_download_folder_name(
+    connection: sqlite3.Connection,
+    job: sqlite3.Row,
+    output_root: str,
+    reserved_paths: set[str],
+    include_video_source: bool,
+    max_video_height: int | None,
+) -> str:
+    channel = ensure_channel(connection, job["channel_id"])
+    latest = latest_queue_task(connection, job["id"], "download_only")
+    if (
+        latest
+        and latest["output_root"] == output_root
+        and latest["output_folder_name"]
+        and bool(latest["include_video_source"]) == include_video_source
+        and latest["max_video_height"] == max_video_height
+    ):
+        latest_name = latest["output_folder_name"]
+        latest_key = download_folder_path_key(output_root, channel["name"], channel["id"], latest_name)
+        if latest_key not in reserved_paths:
+            reserved_paths.add(latest_key)
+            return latest_name
+
+    first_number = download_only_position_in_channel(connection, job)
+    root = Path(output_root).expanduser().resolve()
+    channel_folder = safe_directory_component(channel["name"], channel["id"][:8])
+    number = first_number
+    while True:
+        folder_name = f"video {number}"
+        directory = root / channel_folder / folder_name
+        path_key = str(directory).casefold()
+        occupied_on_disk = directory.exists() and (not directory.is_dir() or any(directory.iterdir()))
+        if path_key not in reserved_paths and not occupied_on_disk:
+            reserved_paths.add(path_key)
+            return folder_name
+        number += 1
+
+
 def launch_queue_worker(connection: sqlite3.Connection, database_path: str) -> bool:
     connection.execute("BEGIN IMMEDIATE")
     runtime = connection.execute("SELECT * FROM queue_runtime WHERE id = 1").fetchone()
@@ -3846,7 +4305,29 @@ def start_queue_tasks(connection: sqlite3.Connection, database_path: str, params
     output_root = str(params.get("output_root", "")).strip()
     if not output_root:
         raise ValueError("Choose an output folder before starting queued jobs.")
+    if not Path(output_root).expanduser().is_dir():
+        raise ValueError("The selected output folder is no longer available. Choose another folder.")
+    include_video_source = bool(params.get("include_video_source", pipeline == "download_only"))
+    raw_max_video_height = params.get("max_video_height")
+    if pipeline != "download_only" or raw_max_video_height in (None, ""):
+        max_video_height = None
+    else:
+        try:
+            max_video_height = int(raw_max_video_height)
+        except (ValueError, TypeError, OverflowError) as error:
+            raise ValueError("Maximum video resolution must be Best available, 1080p, 720p, 480p, or 360p.") from error
+        if max_video_height not in {360, 480, 720, 1080}:
+            raise ValueError("Maximum video resolution must be Best available, 1080p, 720p, 480p, or 360p.")
+    if not include_video_source:
+        max_video_height = None
     normalized_ids = list(dict.fromkeys(str(job_id) for job_id in job_ids))
+    positions = {
+        row["id"]: row["position"]
+        for row in connection.execute("SELECT id, position FROM video_jobs WHERE batch_id = ?", (batch_id,)).fetchall()
+    }
+    normalized_ids.sort(key=lambda job_id: positions.get(job_id, 2**31 - 1))
+    connection.execute("BEGIN IMMEDIATE")
+    reserved_download_paths = reserved_download_folder_paths(connection, output_root) if pipeline == "download_only" else set()
     for job_id in normalized_ids:
         job = connection.execute("SELECT * FROM video_jobs WHERE id = ? AND batch_id = ?", (job_id, batch_id)).fetchone()
         if job is None:
@@ -3856,7 +4337,8 @@ def start_queue_tasks(connection: sqlite3.Connection, database_path: str, params
         if pipeline == "video" and job["download_status"] == "complete" and job["render_status"] == "complete":
             continue
         if pipeline == "download_only":
-            source_video = Path(job["source_video_path"] or "")
+            source_path = job["source_video_path"] if include_video_source else job["source_audio_path"]
+            source_media = Path(source_path or "")
             source_thumbnail = Path(job["source_thumbnail_path"] or "")
             latest_download = latest_queue_task(connection, job_id, pipeline)
             subtitle_ready = job["subtitle_decision"] == "skip"
@@ -3868,7 +4350,15 @@ def start_queue_tasks(connection: sqlite3.Connection, database_path: str, params
                     (job_id,),
                 ).fetchone()
                 subtitle_ready = bool(artifact and Path(artifact["path"]).is_file())
-            if latest_download and latest_download["state"] == "complete" and source_video.is_file() and source_thumbnail.is_file() and subtitle_ready:
+            if (
+                latest_download
+                and latest_download["state"] == "complete"
+                and bool(latest_download["include_video_source"]) == include_video_source
+                and latest_download["max_video_height"] == max_video_height
+                and source_media.is_file()
+                and source_thumbnail.is_file()
+                and subtitle_ready
+            ):
                 continue
         if pipeline == "thumbnail":
             if effective_thumbnail_mode(connection, job) == "skip":
@@ -3889,9 +4379,13 @@ def start_queue_tasks(connection: sqlite3.Connection, database_path: str, params
             continue
         task_id = str(uuid.uuid4())
         now = utc_now()
+        task_include_video_source = include_video_source if pipeline == "download_only" else bool(params.get("include_video_source", job["include_video_source"]))
+        output_folder_name = allocate_download_folder_name(
+            connection, job, output_root, reserved_download_paths, task_include_video_source, max_video_height,
+        ) if pipeline == "download_only" else None
         connection.execute(
-            "INSERT INTO queue_tasks(id, batch_id, job_id, pipeline, state, stage, progress, output_root, include_video_source, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', 'queued', 0, ?, ?, ?, ?)",
-            (task_id, batch_id, job_id, pipeline, output_root, int(pipeline == "download_only" or bool(params.get("include_video_source", job["include_video_source"]))), now, now),
+            "INSERT INTO queue_tasks(id, batch_id, job_id, pipeline, state, stage, progress, output_root, output_folder_name, max_video_height, include_video_source, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', 'queued', 0, ?, ?, ?, ?, ?, ?)",
+            (task_id, batch_id, job_id, pipeline, output_root, output_folder_name, max_video_height, int(task_include_video_source), now, now),
         )
         if pipeline == "thumbnail":
             connection.execute("UPDATE video_jobs SET thumbnail_ocr_status = 'queued', thumbnail_progress = 0, thumbnail_error = NULL WHERE id = ?", (job_id,))
@@ -3947,6 +4441,24 @@ def cancel_queue_task(connection: sqlite3.Connection, task_id: str) -> dict[str,
         queue_log(connection, task_id, "Cancellation requested. The active media process will stop safely.", "warning")
     connection.commit()
     return queue_task_view(connection, connection.execute("SELECT * FROM queue_tasks WHERE id = ?", (task_id,)).fetchone())
+
+
+def remove_queue_task(connection: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    task = connection.execute("SELECT job_id, pipeline, state FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+    if task is None:
+        raise ValueError("Queue task was not found.")
+    removable_states = ("queued", "complete", "failed", "cancelled", "interrupted")
+    result = connection.execute(
+        "DELETE FROM queue_tasks WHERE id = ? AND state IN (?, ?, ?, ?, ?)",
+        (task_id, *removable_states),
+    )
+    if result.rowcount != 1:
+        current = connection.execute("SELECT state FROM queue_tasks WHERE id = ?", (task_id,)).fetchone()
+        if current is None:
+            raise ValueError("Queue task was not found.")
+        raise ValueError("Only queued or finished queue tasks can be removed. Cancel active tasks first.")
+    connection.commit()
+    return {"removed": result.rowcount, "job_id": task["job_id"], "pipeline": task["pipeline"]}
 
 
 def configure_queue(connection: sqlite3.Connection, params: dict[str, Any]) -> dict[str, int]:
@@ -4023,12 +4535,17 @@ def prepare_download_only_package(connection: sqlite3.Connection, task: sqlite3.
     job = connection.execute("SELECT * FROM video_jobs WHERE id = ?", (task["job_id"],)).fetchone()
     if job is None:
         raise ValueError("Video job was not found while preparing its download package.")
-    source_video = Path(job["source_video_path"] or "")
+    include_video_source = bool(task["include_video_source"])
+    source_media = Path((job["source_video_path"] if include_video_source else job["source_audio_path"]) or "")
     source_thumbnail = Path(job["source_thumbnail_path"] or "")
-    if not source_video.is_file():
-        raise ValueError("The full YouTube source video is missing from this download package.")
+    if not source_media.is_file():
+        raise ValueError("The requested YouTube source media is missing from this download package.")
     if not source_thumbnail.is_file():
         raise ValueError("The original YouTube thumbnail is missing from this download package.")
+    title_file = source_media.parent / "title.txt"
+    title = str(job["title"] or job["video_id"] or "Untitled video").strip()
+    title_file.write_text(f"{title}\n", encoding="utf-8")
+    add_job_artifact(connection, job["id"], "video_title", str(title_file))
 
     subtitle_path: Path | None = None
     if job["subtitle_decision"] == "youtube":
@@ -4044,7 +4561,7 @@ def prepare_download_only_package(connection: sqlite3.Connection, task: sqlite3.
         supplied_path = Path(job["supplied_subtitle_path"])
         if not supplied_path.is_file():
             raise ValueError("The supplied subtitle file is no longer available. Attach it again or Skip captions.")
-        directory = job_download_directory(connection, job, task["output_root"])
+        directory = job_download_directory(connection, job, task["output_root"], task["output_folder_name"])
         subtitle_path = directory / f"subtitle.supplied{supplied_path.suffix.lower()}"
         if supplied_path.resolve() != subtitle_path.resolve():
             shutil.copy2(supplied_path, subtitle_path)
@@ -4075,7 +4592,9 @@ def process_queue_task(connection: sqlite3.Connection, task_id: str) -> None:
             connection.execute("UPDATE queue_tasks SET state = 'waiting_for_captions', stage = 'waiting_for_captions', updated_at = ? WHERE id = ?", (utc_now(), task_id))
             queue_log(connection, task_id, "Source media is saved. Waiting for an SRT/VTT choice or Skip captions.", "warning")
             return
-        source_path = job["source_video_path"] if download_only else job["source_audio_path"] or job["source_video_path"]
+        source_path = (
+            job["source_video_path"] if task["include_video_source"] else job["source_audio_path"]
+        ) if download_only else job["source_audio_path"] or job["source_video_path"]
         source_available = bool(source_path and Path(source_path).is_file())
         thumbnail_available = bool(job["source_thumbnail_path"] and Path(job["source_thumbnail_path"]).is_file())
         subtitle_available = job["subtitle_decision"] in {"skip", "use_file"}
@@ -4095,9 +4614,11 @@ def process_queue_task(connection: sqlite3.Connection, task_id: str) -> None:
                 task["batch_id"],
                 task["job_id"],
                 task["output_root"],
-                bool(task["include_video_source"]) or download_only,
+                bool(task["include_video_source"]),
                 task_id,
                 download_only=download_only,
+                output_folder_name=task["output_folder_name"],
+                max_video_height=task["max_video_height"],
             )
             if downloaded["download_status"] == "needs_subtitle_decision":
                 connection.execute("UPDATE queue_tasks SET state = 'waiting_for_captions', stage = 'waiting_for_captions', progress = 0.52, updated_at = ? WHERE id = ?", (utc_now(), task_id))
@@ -4113,7 +4634,7 @@ def process_queue_task(connection: sqlite3.Connection, task_id: str) -> None:
             prepare_download_only_package(connection, task)
             connection.execute("UPDATE video_jobs SET download_status = 'complete', download_progress = 1, download_error = NULL WHERE id = ?", (task["job_id"],))
             connection.commit()
-            queue_log(connection, task_id, "Source video, original thumbnail, and available subtitle files are ready in the job folder.")
+            queue_log(connection, task_id, "Source media, original thumbnail, and available subtitle files are ready in the job folder.")
             finish_queue_task(connection, task_id, "complete")
             return
         queue_log(connection, task_id, "Source files are ready; rendering the assigned Background.")
@@ -4154,14 +4675,22 @@ def run_queue_worker(database_path: str, token: str) -> int:
         runtime = connection.execute("SELECT * FROM queue_runtime WHERE id = 1").fetchone()
         if not runtime or runtime["token"] != token:
             return 2
-        connection.execute("UPDATE queue_runtime SET state = 'running', pid = ?, updated_at = ? WHERE id = 1", (os.getpid(), utc_now()))
+        now = utc_now()
+        started = connection.execute("UPDATE queue_runtime SET state = 'running', pid = ?, heartbeat_at = ?, updated_at = ? WHERE id = 1 AND token = ?", (os.getpid(), now, now, token))
+        if started.rowcount != 1:
+            return 2
         connection.commit()
         active_tasks = set()
+        last_heartbeat = time.monotonic()
         with ThreadPoolExecutor(max_workers=4, thread_name_prefix="media-job") as executor:
             while True:
                 runtime = connection.execute("SELECT * FROM queue_runtime WHERE id = 1").fetchone()
                 if not runtime or runtime["token"] != token or runtime["state"] != "running":
                     break
+                monotonic_now = time.monotonic()
+                if monotonic_now - last_heartbeat >= QUEUE_WORKER_HEARTBEAT_INTERVAL_SECONDS:
+                    queue_worker_heartbeat(connection, token)
+                    last_heartbeat = monotonic_now
                 concurrency = max(1, min(4, int(runtime["max_concurrency"])))
                 while len(active_tasks) < concurrency:
                     task = connection.execute("SELECT id FROM queue_tasks WHERE state = 'queued' ORDER BY created_at, id LIMIT 1").fetchone()
@@ -4199,6 +4728,10 @@ def dispatch(connection: sqlite3.Connection, method: str, params: dict[str, Any]
         return youtube_cookie_settings(connection)
     if method == "settings.youtube_cookies.set":
         return set_youtube_cookie_file(connection, params.get("path"))
+    if method == "settings.output_directory.get":
+        return output_directory_settings(connection)
+    if method == "settings.output_directory.set":
+        return set_output_directory_setting(connection, params.get("path"))
     if method == "queue.heartbeat":
         return queue_heartbeat(connection)
     if method == "queue.status":
@@ -4218,6 +4751,8 @@ def dispatch(connection: sqlite3.Connection, method: str, params: dict[str, Any]
         return retry_queue_task(connection, database_path or str(connection.execute("PRAGMA database_list").fetchone()[2]), task_id)
     if method == "queue.cancel":
         return cancel_queue_task(connection, str(params.get("task_id", "")))
+    if method == "queue.remove":
+        return remove_queue_task(connection, str(params.get("task_id", "")))
     if method == "channels.list":
         return list_channels(connection)
     if method == "channels.create":
@@ -4305,6 +4840,8 @@ def dispatch(connection: sqlite3.Connection, method: str, params: dict[str, Any]
         return result
     if method == "subtitles.font.inspect":
         return inspect_font_family(str(params.get("font_family", "")))
+    if method == "subtitles.fonts.list":
+        return list_installed_subtitle_fonts()
     if method == "channels.set_active":
         channel_id = str(params.get("channel_id", ""))
         ensure_channel(connection, channel_id)
@@ -4386,6 +4923,10 @@ def dispatch(connection: sqlite3.Connection, method: str, params: dict[str, Any]
         return list_batches(connection)
     if method == "batches.get":
         return get_batch(connection, str(params.get("batch_id", "")))
+    if method == "batches.delete":
+        return delete_batch(connection, str(params.get("batch_id", "")))
+    if method == "batches.set_output_root":
+        return set_batch_output_root(connection, str(params.get("batch_id", "")), params.get("path"))
     if method == "batches.import_text":
         raw_channel_id = params.get("channel_id")
         return import_batch_text(
@@ -4477,12 +5018,14 @@ def dispatch(connection: sqlite3.Connection, method: str, params: dict[str, Any]
     if method == "jobs.skip_captions":
         return skip_job_captions(connection, str(params.get("job_id", "")))
     if method == "jobs.download_sources":
+        raw_max_video_height = params.get("max_video_height")
         return download_job_sources(
             connection,
             str(params.get("batch_id", "")),
             str(params.get("job_id", "")),
             str(params.get("output_dir", "")),
             bool(params.get("include_video_source", False)),
+            max_video_height=int(raw_max_video_height) if raw_max_video_height not in (None, "") else None,
         )
     raise ValueError(f"Unknown worker method: {method}")
 
@@ -4510,6 +5053,9 @@ def respond(database_path: str, request: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> int:
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", required=True)
     parser.add_argument("--queue-worker-token")

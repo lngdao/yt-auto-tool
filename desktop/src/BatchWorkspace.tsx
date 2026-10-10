@@ -17,7 +17,7 @@ import {
 } from "@phosphor-icons/react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { BackgroundAsset, BatchSummary, BatchView, Channel, OutputProfile, QueueStatus, QueueTask, RenderPlan, ThumbnailMode, ThumbnailPreset, VideoJob, workerRequest } from "./worker";
+import { BackgroundAsset, BatchSummary, BatchView, Channel, OutputDirectorySettings, OutputProfile, QueueStatus, QueueTask, RenderPlan, ThumbnailMode, ThumbnailPreset, VideoJob, workerRequest } from "./worker";
 import "./BatchWorkspace.css";
 
 type ImportMode = "paste" | "file";
@@ -50,6 +50,8 @@ export default function BatchWorkspace() {
   const [current, setCurrent] = useState<BatchView | null>(null);
   const [queueTasks, setQueueTasks] = useState<QueueTask[]>([]);
   const [queueConcurrency, setQueueConcurrency] = useState(1);
+  const [downloadIncludeVideo, setDownloadIncludeVideo] = useState(true);
+  const [downloadMaxVideoHeight, setDownloadMaxVideoHeight] = useState<number | null>(null);
   const [composer, setComposer] = useState(false);
   const [importMode, setImportMode] = useState<ImportMode>("paste");
   const [workflowMode, setWorkflowMode] = useState<WorkflowMode>("render");
@@ -72,11 +74,12 @@ export default function BatchWorkspace() {
   const [thumbnailJobId, setThumbnailJobId] = useState<string | null>(null);
   const [thumbnailText, setThumbnailText] = useState("");
   const [queueLogTaskId, setQueueLogTaskId] = useState<string | null>(null);
-  const [outputDirectory, setOutputDirectory] = useState("");
+  const [defaultOutputDirectory, setDefaultOutputDirectory] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const outputDirectory = current?.batch.output_root || defaultOutputDirectory;
 
   const isDraft = current?.batch.state === "draft";
   const downloadOnly = current?.batch.workflow_mode === "download_only";
@@ -96,6 +99,26 @@ export default function BatchWorkspace() {
       ),
     );
   }, [backgroundPools, selectedJobRows]);
+
+  useEffect(() => {
+    let active = true;
+    void workerRequest<OutputDirectorySettings>("settings.output_directory.get")
+      .then((settings) => {
+        if (active) setDefaultOutputDirectory(settings.available ? settings.path ?? "" : "");
+      })
+      .catch((caught) => setError(String(caught)));
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    setDownloadIncludeVideo(true);
+    setDownloadMaxVideoHeight(null);
+  }, [current?.batch.id]);
+
+  useEffect(() => {
+    setDownloadIncludeVideo(true);
+    setDownloadMaxVideoHeight(null);
+  }, [current?.batch.id]);
 
   async function refreshList() {
     const [nextChannels, nextBatches] = await Promise.all([
@@ -125,6 +148,77 @@ export default function BatchWorkspace() {
     setSelectedJobs([]);
     setBulkAssetId("");
     setUrlEdits(Object.fromEntries(next.jobs.map((job) => [job.id, job.url])));
+  }
+
+  async function deleteBatch(batch: BatchSummary) {
+    const confirmed = window.confirm(
+      `Delete “${batch.name}” from the app? Its downloaded files will be kept. Cancel or finish active jobs first.`,
+    );
+    if (!confirmed) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await workerRequest("batches.delete", { batch_id: batch.id });
+      await refreshList();
+      setNotice(`Deleted “${batch.name}”. Downloaded files were kept.`);
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveBatchOutputRoot(path: string | null) {
+    if (!current) return;
+    const updated = await workerRequest<BatchSummary>("batches.set_output_root", {
+      batch_id: current.batch.id,
+      path,
+    });
+    setCurrent((previous) => previous && previous.batch.id === updated.id
+      ? { ...previous, batch: updated }
+      : previous);
+  }
+
+  async function changeBatchOutputRoot() {
+    setBusy(true);
+    setError(null);
+    try {
+      const selectedDirectory = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose this batch's output folder",
+      });
+      if (typeof selectedDirectory !== "string") return;
+      await saveBatchOutputRoot(selectedDirectory);
+      setNotice("Output folder saved for this batch.");
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function useDefaultOutputRoot() {
+    setBusy(true);
+    setError(null);
+    try {
+      await saveBatchOutputRoot(null);
+      setNotice(defaultOutputDirectory ? "This batch will use the Settings default folder." : "This batch will ask for a folder when queued.");
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function ensureOutputDirectory(title: string): Promise<string | null> {
+    if (outputDirectory) return outputDirectory;
+    if (!current) return null;
+    const selectedDirectory = await open({ directory: true, multiple: false, title });
+    if (typeof selectedDirectory !== "string") return null;
+    await saveBatchOutputRoot(selectedDirectory);
+    return selectedDirectory;
   }
 
   useEffect(() => {
@@ -195,9 +289,17 @@ export default function BatchWorkspace() {
       setComposer(false);
       const addedCount = Math.max(0, imported.jobs.length - previousJobCount);
       const importedMode = appendToBatchId ? current?.batch.workflow_mode : workflowMode;
-      setNotice(importedMode === "download_only" ? `Imported ${addedCount} video ${addedCount === 1 ? "job" : "jobs"}. Review the channel and subtitle choices before confirming.` : `Imported ${addedCount} video ${addedCount === 1 ? "job" : "jobs"}. Review channel and background assignments before confirming.`);
+      setNotice(`Imported ${addedCount} video ${addedCount === 1 ? "job" : "jobs"}. Looking up video details with yt-dlp…`);
+      const metadata = await workerRequest<VideoJob[]>("batches.lookup_metadata", { batch_id: imported.batch.id });
+      await refreshBatch(imported.batch.id);
+      const failed = metadata.filter((job) => job.metadata_status === "error").length;
+      const nextStep = importedMode === "download_only" ? "Review channel and subtitle choices before confirming." : "Review channel and background assignments before confirming.";
+      setNotice(failed
+        ? `Imported ${addedCount} video ${addedCount === 1 ? "job" : "jobs"}; ${failed} need attention. ${nextStep}`
+        : `Imported ${addedCount} video ${addedCount === 1 ? "job" : "jobs"} and loaded video details. ${nextStep}`);
     } catch (caught) {
       setError(String(caught));
+      setNotice(null);
     } finally {
       setBusy(false);
     }
@@ -542,13 +644,8 @@ export default function BatchWorkspace() {
     setBusy(true);
     setError(null);
     try {
-      let directory = outputDirectory;
-      if (!directory) {
-        const selectedDirectory = await open({ directory: true, multiple: false, title: "Choose the source media folder" });
-        if (typeof selectedDirectory !== "string") return;
-        directory = selectedDirectory;
-        setOutputDirectory(directory);
-      }
+      const directory = await ensureOutputDirectory("Choose the source media folder");
+      if (!directory) return;
       const downloaded = await workerRequest<VideoJob>("jobs.download_sources", {
         batch_id: current.batch.id,
         job_id: job.id,
@@ -571,13 +668,8 @@ export default function BatchWorkspace() {
     setBusy(true);
     setError(null);
     try {
-      let directory = outputDirectory;
-      if (!directory) {
-        const selectedDirectory = await open({ directory: true, multiple: false, title: "Choose the output folder for this queue" });
-        if (typeof selectedDirectory !== "string") return;
-        directory = selectedDirectory;
-        setOutputDirectory(directory);
-      }
+      const directory = await ensureOutputDirectory("Choose the output folder for this queue");
+      if (!directory) return;
       let result: QueueStatus | null = null;
       for (let index = 0; index < jobIds.length; index += 500) {
         result = await workerRequest<QueueStatus>("queue.start", {
@@ -585,6 +677,10 @@ export default function BatchWorkspace() {
           job_ids: jobIds.slice(index, index + 500),
           output_root: directory,
           pipeline,
+          ...(pipeline === "download_only" ? {
+            include_video_source: downloadIncludeVideo,
+            max_video_height: downloadIncludeVideo ? downloadMaxVideoHeight : null,
+          } : {}),
         });
       }
       if (!result) return;
@@ -603,6 +699,40 @@ export default function BatchWorkspace() {
     try {
       await workerRequest<QueueTask>("queue.cancel", { task_id: task.id });
       if (current) await refreshBatch(current.batch.id);
+    } catch (caught) { setError(String(caught)); }
+    finally { setBusy(false); }
+  }
+
+  async function cancelSelectedDownloads(jobIds: string[]) {
+    if (!current || !jobIds.length) return;
+    const cancellable = current.jobs
+      .filter((job) => jobIds.includes(job.id))
+      .map((job) => job.download_queue_task)
+      .filter((task): task is NonNullable<typeof task> => task !== null && ["queued", "starting", "downloading", "rendering", "cancel_requested", "waiting_for_captions"].includes(task.state));
+    if (!cancellable.length) {
+      setNotice("There are no selected downloads to cancel.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      for (const task of cancellable) {
+        await workerRequest("queue.cancel", { task_id: task.id });
+      }
+      await refreshBatch(current.batch.id);
+      setNotice(`Cancelled ${cancellable.length} selected download${cancellable.length === 1 ? "" : "s"}.`);
+    } catch (caught) { setError(String(caught)); }
+    finally { setBusy(false); }
+  }
+
+  async function removeQueueTask(taskId: string) {
+    if (!current) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await workerRequest("queue.remove", { task_id: taskId });
+      await refreshBatch(current.batch.id);
+      setNotice("Removed the queue entry. Saved files are unchanged.");
     } catch (caught) { setError(String(caught)); }
     finally { setBusy(false); }
   }
@@ -656,14 +786,34 @@ export default function BatchWorkspace() {
               <button className="batch-back" type="button" onClick={() => { setCurrent(null); setComposer(false); setNotice(null); }}><ArrowLeft size={14} /> All batches</button>
               <div className="batch-eyebrow">{downloadOnly ? "DOWNLOAD ONLY" : "BATCH REVIEW"} <span className={`batch-state ${current.batch.state}`}>{current.batch.state === "draft" ? "Draft" : "Confirmed"}</span></div>
               <h1>{current.batch.name}</h1>
-              <p>{current.jobs.length} jobs · {current.batch.ready_count} ready · {current.batch.unresolved_count} need review{downloadOnly ? " · downloads full videos, captions, and original thumbnails" : ""}</p>
+              <p>{current.jobs.length} jobs · {current.batch.ready_count} ready · {current.batch.unresolved_count} need review{downloadOnly ? " · downloads selected media, captions, and original thumbnails" : ""}</p>
+              <div className="batch-output-setting">
+                <FolderOpen size={15} />
+                <span><strong>Output folder</strong><small title={outputDirectory || undefined}>{outputDirectory || "Choose once before queueing; saved for this batch"}</small></span>
+                <button type="button" onClick={() => void changeBatchOutputRoot()} disabled={busy}>{outputDirectory ? "Change folder" : "Choose folder"}</button>
+                {current.batch.output_root && <button type="button" onClick={() => void useDefaultOutputRoot()} disabled={busy}>Use Settings default</button>}
+              </div>
+              {downloadOnly && <div className="download-batch-options">
+                <label><span>Download media</span><select value={downloadIncludeVideo ? "video" : "audio"} onChange={(event) => {
+                  const includeVideo = event.target.value === "video";
+                  setDownloadIncludeVideo(includeVideo);
+                  if (!includeVideo) setDownloadMaxVideoHeight(null);
+                }} disabled={busy}>
+                  <option value="video">Full video + audio</option>
+                  <option value="audio">Audio only</option>
+                </select></label>
+                {downloadIncludeVideo && <label><span>Maximum resolution</span><select value={downloadMaxVideoHeight ?? ""} onChange={(event) => setDownloadMaxVideoHeight(event.target.value ? Number(event.target.value) : null)} disabled={busy}>
+                  <option value="">Best available</option><option value="1080">Up to 1080p</option><option value="720">Up to 720p</option><option value="480">Up to 480p</option><option value="360">Up to 360p</option>
+                </select></label>}
+                <small>Applies to every job in the next download queue action. Active tasks keep their existing settings.</small>
+              </div>}
               {batchQueueTasks.length > 0 && <div className="batch-queue-progress"><div><span>{completedQueueTasks}/{batchQueueTasks.length} {downloadOnly ? "downloads" : "pipeline tasks"} finished</span><strong>{Math.round(batchQueueProgress * 100)}%</strong></div><progress max="1" value={batchQueueProgress} /></div>}
             </div>
             <div className="batch-actions">
               {isDraft && !downloadOnly && <button className="batch-button batch-button-secondary" type="button" onClick={() => void rebalance()} disabled={busy}><Repeat size={15} /> Rebalance</button>}
               {isDraft && <button className="batch-button batch-button-secondary" type="button" onClick={() => void lookupMetadata()} disabled={busy}><MagnifyingGlass size={15} /> Fetch video details</button>}
               {isDraft && <button className="batch-button batch-button-primary" type="button" onClick={() => void confirmBatch()} disabled={busy || current.batch.ready_count !== current.jobs.length || !current.jobs.length}>{busy ? <CircleNotch className="batch-spin" size={15} /> : <Check size={15} />} {downloadOnly ? "Confirm download list" : "Confirm assignments"}</button>}
-              {!isDraft && downloadOnly && <button className="batch-button batch-button-primary" type="button" onClick={() => void queueJobs(current.jobs.map((job) => job.id), "download_only")} disabled={busy || !current.jobs.length}><FolderOpen size={15} /> Download all packages</button>}
+              {!isDraft && downloadOnly && <><button className="batch-button batch-button-primary" type="button" onClick={() => void queueJobs(current.jobs.map((job) => job.id), "download_only")} disabled={busy || !current.jobs.length}><FolderOpen size={15} /> Download all packages</button>{current.jobs.some((job) => job.download_queue_task && ["queued", "starting", "downloading", "rendering", "cancel_requested", "waiting_for_captions"].includes(job.download_queue_task.state)) && <button className="batch-button batch-button-secondary" type="button" onClick={() => void cancelSelectedDownloads(current.jobs.map((job) => job.id))} disabled={busy}>Cancel all packages</button>}</>}
               {!isDraft && !downloadOnly && <><button className="batch-button batch-button-primary" type="button" onClick={() => void queueJobs(current.jobs.map((job) => job.id), "video")} disabled={busy || !current.jobs.length}><VideoCamera size={15} /> Queue all videos</button><button className="batch-button batch-button-secondary" type="button" onClick={() => void queueJobs(current.jobs.map((job) => job.id), "thumbnail")} disabled={busy || !current.jobs.length}><ImageSquare size={15} /> Queue thumbnails</button></>}
               {!isDraft && <label className="queue-concurrency-control">Concurrent jobs<select aria-label="Maximum concurrent queue jobs" value={queueConcurrency} onChange={(event) => void setQueueConcurrencyLimit(Number(event.target.value))} disabled={busy}><option value={1}>1 · safe default</option><option value={2}>2</option><option value={3}>3</option><option value={4}>4</option></select></label>}
             </div>
@@ -688,8 +838,8 @@ export default function BatchWorkspace() {
           </section>}
 
           {isDraft && !downloadOnly && selectedJobs.length > 0 && <div className="bulk-toolbar"><span><strong>{selectedJobs.length}</strong> selected</span><div className="bulk-control"><span>Assign shared background</span><select value={bulkAssetId} onChange={(event) => setBulkAssetId(event.target.value)}><option value="">Select a background available to all selected channels</option>{bulkAssetOptions.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}</select><button type="button" onClick={() => void assignBulkBackground()} disabled={busy || !bulkAssetId}>Apply</button></div><button type="button" className="bulk-clear" onClick={() => setSelectedJobs([])}>Clear selection</button></div>}
-          {isDraft && downloadOnly && selectedJobs.length > 0 && <div className="bulk-toolbar"><span><strong>{selectedJobs.length}</strong> selected</span><div className="bulk-control"><span>Each package includes the full video, preferred captions when available, and original thumbnail.</span></div><button type="button" className="bulk-clear" onClick={() => setSelectedJobs([])}>Clear selection</button></div>}
-          {!isDraft && downloadOnly && selectedJobs.length > 0 && <div className="bulk-toolbar"><span><strong>{selectedJobs.length}</strong> job{selectedJobs.length === 1 ? "" : "s"} selected</span><button className="batch-button batch-button-primary" type="button" onClick={() => void queueJobs(selectedJobs, "download_only")} disabled={busy}><FolderOpen size={14} /> Download selected packages</button><button type="button" className="bulk-clear" onClick={() => setSelectedJobs([])}>Clear selection</button></div>}
+          {isDraft && downloadOnly && selectedJobs.length > 0 && <div className="bulk-toolbar"><span><strong>{selectedJobs.length}</strong> selected</span><div className="bulk-control"><span>Each package includes {downloadIncludeVideo ? "full video" + (downloadMaxVideoHeight ? " up to " + downloadMaxVideoHeight + "p" : "") : "audio only"}, preferred captions when available, and the original thumbnail.</span></div><button type="button" className="bulk-clear" onClick={() => setSelectedJobs([])}>Clear selection</button></div>}
+          {!isDraft && downloadOnly && selectedJobs.length > 0 && <div className="bulk-toolbar"><span><strong>{selectedJobs.length}</strong> job{selectedJobs.length === 1 ? "" : "s"} selected</span><button className="batch-button batch-button-primary" type="button" onClick={() => void queueJobs(selectedJobs, "download_only")} disabled={busy}><FolderOpen size={14} /> Download selected packages</button><button className="batch-button batch-button-secondary" type="button" onClick={() => void cancelSelectedDownloads(selectedJobs)} disabled={busy}>Cancel selected</button><button type="button" className="bulk-clear" onClick={() => setSelectedJobs([])}>Clear selection</button></div>}
           {!isDraft && !downloadOnly && selectedJobs.length > 0 && <div className="bulk-toolbar bulk-output-toolbar"><span><strong>{selectedJobs.length}</strong> job{selectedJobs.length === 1 ? "" : "s"} selected</span><div className="bulk-control"><span>Apply output profile</span><select value={bulkOutput.profile} onChange={(event) => setBulkOutput((state) => ({ ...state, profile: event.target.value as OutputProfile["profile"] }))}><option value="720p">720p · 1280×720</option><option value="match_background">Match background</option></select><select aria-label="Frame selection for selected jobs" value={bulkOutput.frame_preference ?? "profile"} onChange={(event) => setBulkOutput((state) => ({ ...state, frame_preference: event.target.value as "profile" | "background" }))}><option value="profile">Keep profile frame</option><option value="background">Use background frame</option></select><select aria-label="Background fit for selected jobs" value={bulkOutput.fit_mode} onChange={(event) => setBulkOutput((state) => ({ ...state, fit_mode: event.target.value as "crop" | "contain" }))}><option value="crop">Crop-to-fill</option><option value="contain">Contain/pad</option></select><button type="button" onClick={() => void applyBulkOutputSettings()} disabled={busy}>Apply to selected</button><button type="button" onClick={() => void queueJobs(selectedJobs, "video")} disabled={busy}>Queue videos</button><button type="button" onClick={() => void queueJobs(selectedJobs, "thumbnail")} disabled={busy}>Queue thumbnails</button></div><button type="button" className="bulk-clear" onClick={() => setSelectedJobs([])}>Clear selection</button></div>}
 
           <div className="jobs-table-wrap">
@@ -731,8 +881,10 @@ export default function BatchWorkspace() {
                         {job.download_queue_task.error && <small title={job.download_queue_task.error}>{job.download_queue_task.error}</small>}
                         <div>
                           <button type="button" onClick={() => setQueueLogTaskId(job.download_queue_task!.id)}>Logs</button>
-                          {["queued", "starting", "downloading", "rendering", "cancel_requested"].includes(job.download_queue_task.state) && queueTasks.some((task) => task.id === job.download_queue_task!.id) && <button type="button" onClick={() => { const task = queueTasks.find((item) => item.id === job.download_queue_task!.id); if (task) void cancelQueueTask(task); }} disabled={busy}>Cancel</button>}
+                          {job.download_queue_task.state === "queued" && <button type="button" onClick={() => void removeQueueTask(job.download_queue_task!.id)} disabled={busy}>Remove</button>}
+                          {["starting", "downloading", "rendering", "cancel_requested", "waiting_for_captions"].includes(job.download_queue_task.state) && queueTasks.some((task) => task.id === job.download_queue_task!.id) && <button type="button" onClick={() => { const task = queueTasks.find((item) => item.id === job.download_queue_task!.id); if (task) void cancelQueueTask(task); }} disabled={busy}>Cancel</button>}
                           {(["failed", "cancelled", "interrupted"].includes(job.download_queue_task.state) || (job.download_queue_task.state === "waiting_for_captions" && job.subtitle_decision !== "needs_decision")) && queueTasks.some((task) => task.id === job.download_queue_task!.id) && <button type="button" onClick={() => { const task = queueTasks.find((item) => item.id === job.download_queue_task!.id); if (task) void retryQueueTask(task); }} disabled={busy}>{job.download_queue_task.state === "waiting_for_captions" ? "Resume" : "Retry"}</button>}
+                          {["complete", "failed", "cancelled", "interrupted"].includes(job.download_queue_task.state) && <button type="button" onClick={() => void removeQueueTask(job.download_queue_task!.id)} disabled={busy}>Remove</button>}
                         </div>
                       </div>}
                       {!downloadOnly && job.queue_task && <div className={`job-queue-state ${job.queue_task.state}`}>
@@ -741,7 +893,8 @@ export default function BatchWorkspace() {
                         {job.queue_task.error && <small title={job.queue_task.error}>{job.queue_task.error}</small>}
                         <div>
                           <button type="button" onClick={() => setQueueLogTaskId(job.queue_task!.id)}>Logs</button>
-                          {["queued", "starting", "downloading", "rendering", "cancel_requested"].includes(job.queue_task.state) && queueTasks.some((task) => task.id === job.queue_task!.id) && <button type="button" onClick={() => { const task = queueTasks.find((item) => item.id === job.queue_task!.id); if (task) void cancelQueueTask(task); }} disabled={busy}>Cancel</button>}
+                          {job.queue_task.state === "queued" && <button type="button" onClick={() => void removeQueueTask(job.queue_task!.id)} disabled={busy}>Remove</button>}
+                          {["starting", "downloading", "rendering", "cancel_requested"].includes(job.queue_task.state) && queueTasks.some((task) => task.id === job.queue_task!.id) && <button type="button" onClick={() => { const task = queueTasks.find((item) => item.id === job.queue_task!.id); if (task) void cancelQueueTask(task); }} disabled={busy}>Cancel</button>}
                           {["failed", "cancelled", "interrupted", "waiting_for_captions"].includes(job.queue_task.state) && queueTasks.some((task) => task.id === job.queue_task!.id) && <button type="button" onClick={() => { const task = queueTasks.find((item) => item.id === job.queue_task!.id); if (task) void retryQueueTask(task); }} disabled={busy}>{job.queue_task.state === "waiting_for_captions" ? "Resume" : "Retry"}</button>}
                           {job.queue_task.state === "complete" && job.output_video_path && <button type="button" onClick={() => void revealItemInDir(job.output_video_path!).catch((caught) => setError(String(caught)))}>Open output</button>}
                         </div>
@@ -752,7 +905,8 @@ export default function BatchWorkspace() {
                         {job.thumbnail_queue_task.error && <small title={job.thumbnail_queue_task.error}>{job.thumbnail_queue_task.error}</small>}
                         <div>
                           <button type="button" onClick={() => setQueueLogTaskId(job.thumbnail_queue_task!.id)}>Logs</button>
-                          {["queued", "starting", "downloading", "rendering", "cancel_requested"].includes(job.thumbnail_queue_task.state) && queueTasks.some((task) => task.id === job.thumbnail_queue_task!.id) && <button type="button" onClick={() => { const task = queueTasks.find((item) => item.id === job.thumbnail_queue_task!.id); if (task) void cancelQueueTask(task); }} disabled={busy}>Cancel</button>}
+                          {job.thumbnail_queue_task.state === "queued" && <button type="button" onClick={() => void removeQueueTask(job.thumbnail_queue_task!.id)} disabled={busy}>Remove</button>}
+                          {["starting", "downloading", "rendering", "cancel_requested"].includes(job.thumbnail_queue_task.state) && queueTasks.some((task) => task.id === job.thumbnail_queue_task!.id) && <button type="button" onClick={() => { const task = queueTasks.find((item) => item.id === job.thumbnail_queue_task!.id); if (task) void cancelQueueTask(task); }} disabled={busy}>Cancel</button>}
                           {["failed", "cancelled", "interrupted", "waiting_for_thumbnail_review"].includes(job.thumbnail_queue_task.state) && queueTasks.some((task) => task.id === job.thumbnail_queue_task!.id) && <button type="button" onClick={() => { const task = queueTasks.find((item) => item.id === job.thumbnail_queue_task!.id); if (task) void retryQueueTask(task); }} disabled={busy}>{job.thumbnail_queue_task.state === "waiting_for_thumbnail_review" ? "Resume export" : "Retry"}</button>}
                           {job.thumbnail_queue_task.state === "complete" && job.thumbnail_output_path && <button type="button" onClick={() => void revealItemInDir(job.thumbnail_output_path!).catch((caught) => setError(String(caught)))}>Open PNG</button>}
                         </div>
@@ -760,7 +914,7 @@ export default function BatchWorkspace() {
                     </td>
                     <td className="channel-cell"><select value={job.channel_id ?? ""} onChange={(event) => void updateJob(job, { channel_id: event.target.value || null })} disabled={!isDraft}><option value="">Choose channel…</option>{channels.map((channel) => <option key={channel.id} value={channel.id}>{channel.name}</option>)}</select></td>
                     {!downloadOnly && <td className="background-cell"><select value={job.background_asset_id ?? ""} onChange={(event) => void assignBackground(job, event.target.value)} disabled={!isDraft || !job.channel_id || !options.length}><option value="">{job.channel_id ? options.length ? "Choose background…" : "No backgrounds in pool" : "Choose channel first"}</option>{options.map((asset) => <option key={asset.id} value={asset.id} disabled={!asset.available}>{asset.name}{!asset.available ? " (missing)" : ""}</option>)}</select></td>}
-                    <td className="status-cell"><span className={`readiness-pill ${job.readiness === "ready" ? "ready" : job.readiness === "needs_metadata" ? "pending" : "attention"}`} title={job.flags.join(", ")}><span />{readinessLabel(job)}</span>{job.download_status === "needs_subtitle_decision" && <small className="caption-wait-state">Waiting for captions</small>}</td>
+                    <td className="status-cell">{isDraft && ["needs_metadata", "metadata_error"].includes(job.readiness) ? <button type="button" className={`readiness-pill ${job.readiness === "needs_metadata" ? "pending" : "attention"}`} title={job.flags.join(", ")} onClick={() => void lookupMetadata()} disabled={busy}><span />{job.readiness === "metadata_error" ? "Retry details" : "Fetch details"}</button> : <span className={`readiness-pill ${job.readiness === "ready" ? "ready" : job.readiness === "needs_metadata" ? "pending" : "attention"}`} title={job.flags.join(", ")}><span />{readinessLabel(job)}</span>}{job.download_status === "needs_subtitle_decision" && <small className="caption-wait-state">Waiting for captions</small>}</td>
                     <td className="row-action-col">{isDraft && <button type="button" className="job-remove" aria-label={`Remove row ${job.row_number}`} title="Remove job" onClick={() => void removeJob(job)}><Trash size={14} /></button>}</td>
                   </tr>;
                 })}
@@ -779,7 +933,22 @@ export default function BatchWorkspace() {
       ) : (
         <>
           <div className="batch-heading-row"><div><span className="batch-eyebrow">BATCH WORKSPACE</span><h1>Video batches</h1><p>Download source packages for Premiere, or prepare and render finished videos.</p></div><button className="batch-button batch-button-primary" type="button" onClick={beginNewBatch}><Plus size={16} weight="bold" /> New batch</button></div>
-          {loading ? <div className="batch-loading"><CircleNotch className="batch-spin" size={19} /> Loading local batches…</div> : batches.length ? <div className="batch-list">{batches.map((batch, index) => <button type="button" key={batch.id} className="batch-list-card" onClick={() => void refreshBatch(batch.id)}><span className={`batch-index index-${index % 4}`}>{String(index + 1).padStart(2, "0")}</span><span className="batch-list-copy"><strong>{batch.name}</strong><small>{new Date(batch.created_at).toLocaleString()} · {batch.job_count} jobs · {batch.workflow_mode === "download_only" ? "Download only" : "Render"}</small></span><span className={`batch-list-state ${batch.state}`}>{batch.state === "draft" ? "Draft" : "Confirmed"}</span><span className="batch-readiness-count">{batch.ready_count}/{batch.job_count}<small>READY</small></span><span className="batch-open-chevron">›</span></button>)}</div> : <div className="batch-empty-state"><div><VideoCamera size={24} weight="duotone" /></div><h2>No batches yet</h2><p>Paste a channel’s URLs or import a CSV/TSV with Channel and URL columns.</p><button className="batch-button batch-button-primary" type="button" onClick={beginNewBatch}><Plus size={15} /> Create your first batch</button></div>}
+          {loading ? <div className="batch-loading"><CircleNotch className="batch-spin" size={19} /> Loading local batches…</div> : batches.length ? (
+            <div className="batch-list">{batches.map((batch, index) => (
+              <div className="batch-list-card" key={batch.id}>
+                <button className="batch-list-open" type="button" onClick={() => void refreshBatch(batch.id)}>
+                  <span className={`batch-index index-${index % 4}`}>{String(index + 1).padStart(2, "0")}</span>
+                  <span className="batch-list-copy"><strong>{batch.name}</strong><small>{new Date(batch.created_at).toLocaleString()} · {batch.job_count} jobs · {batch.workflow_mode === "download_only" ? "Download only" : "Render"}</small></span>
+                  <span className={`batch-list-state ${batch.state}`}>{batch.state === "draft" ? "Draft" : "Confirmed"}</span>
+                  <span className="batch-readiness-count">{batch.ready_count}/{batch.job_count}<small>READY</small></span>
+                  <span className="batch-open-chevron">›</span>
+                </button>
+                <button className="batch-list-delete" type="button" aria-label={`Delete batch ${batch.name}`} title="Delete batch (downloaded files are kept)" onClick={() => void deleteBatch(batch)} disabled={busy}>
+                  <Trash size={15} />
+                </button>
+              </div>
+            ))}</div>
+          ) : <div className="batch-empty-state"><div><VideoCamera size={24} weight="duotone" /></div><h2>No batches yet</h2><p>Paste a channel’s URLs or import a CSV/TSV with Channel and URL columns.</p><button className="batch-button batch-button-primary" type="button" onClick={beginNewBatch}><Plus size={15} /> Create your first batch</button></div>}
         </>
       )}
       {subtitleJob && current && (
@@ -893,8 +1062,8 @@ function ImportForm({ channels, importMode, setImportMode, workflowMode, setWork
     {!compact && <div className="workflow-mode-picker"><span>What should this batch do?</span><div><button type="button" className={workflowMode === "render" ? "active" : ""} onClick={() => setWorkflowMode("render")}><FilmSlate size={16} /><strong>Prepare & render</strong><small>Background video, captions, and export</small></button><button type="button" className={workflowMode === "download_only" ? "active" : ""} onClick={() => setWorkflowMode("download_only")}><FolderOpen size={16} /><strong>Download only</strong><small>Video + captions + original thumbnail for Premiere</small></button></div></div>}
     {compact && <div className="inline-import-mode"><FolderOpen size={14} /> Adding to a {workflowMode === "download_only" ? "Download only" : "Render"} batch</div>}
     <label className="import-label" htmlFor={compact ? "batch-name-inline" : "batch-name"}>Batch name</label><input id={compact ? "batch-name-inline" : "batch-name"} className="batch-input" value={batchName} onChange={(event) => setBatchName(event.target.value)} placeholder="e.g. Monday upload run" maxLength={100} />
-    {importMode === "paste" ? <><label className="import-label" htmlFor={compact ? "batch-channel-inline" : "batch-channel"}>Assign all URLs to</label><select id={compact ? "batch-channel-inline" : "batch-channel"} className="batch-select" value={channelId} onChange={(event) => setChannelId(event.target.value)}><option value="">Choose a channel…</option>{activeChannels.map((channel) => <option value={channel.id} key={channel.id}>{channel.name}{workflowMode === "render" ? ` · ${channel.background_count} backgrounds` : ""}</option>)}</select><label className="import-label" htmlFor={compact ? "batch-urls-inline" : "batch-urls"}>YouTube URLs <span>one URL per line</span></label><textarea id={compact ? "batch-urls-inline" : "batch-urls"} className="batch-textarea" value={urlText} onChange={(event) => setUrlText(event.target.value)} placeholder={"https://www.youtube.com/watch?v=…\nhttps://youtu.be/…\nPaste as many URLs as you need"} rows={compact ? 4 : 8} spellCheck={false} /></> : <><div className="csv-requirements"><strong>Required columns</strong><span>Channel</span><span>URL</span><small>Channel names must match a profile. Unknown names and invalid URLs stay in review for correction.</small></div><label className="csv-file-input"><input type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" onChange={(event) => void onFileChange(event)} /><span className="csv-file-icon"><FolderOpen size={19} /></span><strong>{fileName || "Choose a CSV or TSV file"}</strong><small>{fileContent ? `${fileContent.split(/\r?\n/).filter(Boolean).length - 1} data rows ready to import` : "Files are read locally and not uploaded"}</small></label></>}
-    {!compact && (workflowMode === "download_only" ? <div className="import-assignment-note"><CheckCircle size={15} /> No backgrounds are needed. The app creates one folder per video with the full video, available preferred captions, and original thumbnail.</div> : <div className="import-assignment-note"><CheckCircle size={15} /> Backgrounds will be balanced from each channel’s pool. You can review and override each assignment before confirming.</div>)}
+    {importMode === "paste" ? <><label className="import-label" htmlFor={compact ? "batch-channel-inline" : "batch-channel"}>Assign all URLs to</label><select id={compact ? "batch-channel-inline" : "batch-channel"} className="batch-select" value={channelId} onChange={(event) => setChannelId(event.target.value)}><option value="">Choose a channel…</option>{activeChannels.map((channel) => <option value={channel.id} key={channel.id}>{channel.name}{workflowMode === "render" ? ` · ${channel.background_count} backgrounds` : ""}</option>)}</select><label className="import-label" htmlFor={compact ? "batch-urls-inline" : "batch-urls"}>YouTube URLs <span>one URL per line</span></label><textarea id={compact ? "batch-urls-inline" : "batch-urls"} className="batch-textarea" value={urlText} onChange={(event) => setUrlText(event.target.value)} placeholder={"https://www.youtube.com/watch?v=…\nhttps://youtu.be/…\nPaste as many URLs as you need"} rows={compact ? 4 : 8} spellCheck={false} /></> : <><div className="csv-requirements"><strong>Required columns</strong><span>Channel</span><span>URL</span><small>Each row can target a different channel. Names must match a profile; unknown names and invalid URLs stay in review.</small></div><label className="csv-file-input"><input type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" onChange={(event) => void onFileChange(event)} /><span className="csv-file-icon"><FolderOpen size={19} /></span><strong>{fileName || "Choose a CSV or TSV file"}</strong><small>{fileContent ? `${fileContent.split(/\r?\n/).filter(Boolean).length - 1} data rows ready to import` : "Files are read locally and not uploaded"}</small></label></>}
+    {!compact && (workflowMode === "download_only" ? <div className="import-assignment-note"><CheckCircle size={15} /> No backgrounds are needed. Each channel gets a folder, then jobs are saved as video 1, video 2, etc. in import order with the selected video/audio, available preferred captions, and original thumbnail.</div> : <div className="import-assignment-note"><CheckCircle size={15} /> Backgrounds will be balanced from each channel’s pool. You can review and override each assignment before confirming.</div>)}
     <div className="import-form-actions"><span>{importMode === "paste" ? "No YouTube video will be downloaded during import." : "CSV parsing runs on this device."}</span><button className="batch-button batch-button-primary" type="submit" disabled={busy || (importMode === "paste" ? !urlText.trim() || !channelId : !fileContent.trim())}>{busy ? <CircleNotch className="batch-spin" size={15} /> : <Plus size={15} />} Import jobs</button></div>
   </form>;
 }

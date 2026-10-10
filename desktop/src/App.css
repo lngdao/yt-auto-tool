@@ -39,6 +39,7 @@
 .cookie-file-copy strong { display: block; color: #46534a; font-size: 10px; font-weight: 680; }
 .cookie-file-copy span { display: block; overflow: hidden; margin-top: 4px; color: #8d978e; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .cookie-setting-row .button { height: 33px; font-size: 9px; }
+.default-output-row { align-items: center; }
 .settings-security-note { display: flex; align-items: flex-start; gap: 6px; margin: 11px 2px 0; color: #8a938a; font-size: 9px; line-height: 1.55; }
 .settings-security-note svg { flex: none; margin-top: 1px; color: #9a8a68; }
 .settings-security-note strong { color: #606d62; font-weight: 680; }

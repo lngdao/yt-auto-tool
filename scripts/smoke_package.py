@@ -36,6 +36,13 @@ def main() -> int:
     tools_root = Path(sys.argv[1] if len(sys.argv) > 1 else "desktop/src-tauri/resources/tools").resolve()
     windows = os.name == "nt"
     extension = ".exe" if windows else ""
+    manifest_path = tools_root / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"Packaged tool manifest is missing or unreadable: {manifest_path}\n{error}") from error
+    if not isinstance(manifest, dict) or not all(isinstance(manifest.get(key), dict) for key in ("versions", "files_sha256")):
+        raise SystemExit(f"Packaged tool manifest is invalid: {manifest_path}")
     worker = tools_root / "worker" / "youtube-video-batch-worker" / f"youtube-video-batch-worker{extension}"
     tool_bin = tools_root / "bin"
     ffmpeg = tool_bin / f"ffmpeg{extension}"

@@ -169,7 +169,7 @@ def main() -> int:
         "files_sha256": {
             str(path.relative_to(TOOLS)): sha256(path)
             for path in sorted(TOOLS.rglob("*"))
-            if path.is_file() and path.name != "release-assets.json"
+            if path.is_file() and path.name not in {"release-assets.json", "manifest.json"}
         },
     }
     (TOOLS / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

@@ -38,6 +38,7 @@ export type BatchSummary = {
   id: string;
   name: string;
   workflow_mode: "render" | "download_only";
+  output_root: string | null;
   state: "draft" | "confirmed";
   import_source: string;
   created_at: string;
@@ -62,6 +63,7 @@ export type VideoJob = {
   canonical_url: string | null;
   video_id: string | null;
   title: string | null;
+  video_language: string | null;
   duration_seconds: number | null;
   thumbnail_url: string | null;
   metadata_status: "pending" | "ready" | "error";
@@ -148,6 +150,7 @@ export type ThumbnailPreset = { id: string; owner_channel_id: string | null; nam
 export type OcrLanguage = { code: string; name: string };
 export type SubtitleStyle = {
   font_family: string;
+  bold: boolean;
   font_size: number;
   text_color: string;
   background_enabled: boolean;
@@ -180,6 +183,8 @@ export type QueueTask = {
   stage: string;
   progress: number;
   output_root: string;
+  output_folder_name: string | null;
+  max_video_height: number | null;
   include_video_source: boolean;
   error: string | null;
   cancel_requested: boolean;
@@ -195,6 +200,7 @@ export type LocalToolchainState = { ffmpeg: ToolState; ffprobe: ToolState; tesse
 export type DynamicToolState = { name: string; version: string; latest_version: string; updated: boolean; path: string };
 export type DynamicToolchainState = { yt_dlp: DynamicToolState; deno: DynamicToolState };
 export type YoutubeCookieSettings = { path: string | null; configured: boolean; available: boolean; valid_format: boolean };
+export type OutputDirectorySettings = { path: string | null; configured: boolean; available: boolean };
 
 export function workerRequest<T>(method: string, params: Record<string, unknown> = {}) {
   return invoke<T>("worker_request", { method, params });

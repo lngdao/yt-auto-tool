@@ -106,8 +106,10 @@ Thumbnail handling is independent of video rendering. Auto mode downloads the ac
 - A user can still open source assets and outputs in Premiere for exceptions.
 - Video rendering and thumbnail processing are independent job pipelines. A thumbnail review or error does not block video rendering.
 - Batches have a workflow mode: Render (the existing default) or Download only. Download-only batches need a valid Channel for subtitle-language preferences but do not require a background pool, output profile, thumbnail preset, OCR, or render step.
-- Download-only work fetches the full source video, the source thumbnail regardless of thumbnail Auto/Manual/Skip settings, and the preferred creator or automatic subtitle track. It preserves the downloaded YouTube caption file and writes a Premiere-friendly `captions.srt`; a supplied SRT/VTT is copied into the package and normalized to the same SRT sidecar. If no preferred-language track exists, the job waits for a supplied SRT/VTT or an explicit Skip captions choice.
-- Each download-only job gets its own readable folder under `output root / batch-name-batch-id / channel / title-videoId`, avoiding collisions when a batch name is reused. The queue downloads multiple jobs with progress, cancellation, logs, and retry, then leaves the files ready for manual editing.
+- A Download-only batch can fetch full video plus audio or audio only. Full video can optionally be capped at 1080p, 720p, 480p, or 360p; the choice applies to all jobs added by a queue action.
+- Download-only work also fetches the source thumbnail regardless of thumbnail Auto/Manual/Skip settings and the preferred creator or automatic subtitle track. Each package includes a UTF-8 `title.txt`, preserves the downloaded YouTube caption file, and writes a Premiere-friendly `captions.srt`; a supplied SRT/VTT is copied into the package and normalized to the same SRT sidecar. If no preferred-language track exists, the job waits for a supplied SRT/VTT or an explicit Skip captions choice.
+- Each download-only job gets its own folder under `output root / channel display name / video N`, with N following import order per channel. If a numbered folder already contains files, the queue allocates the next available number; deleting finished video folders lets the sequence start over. Batch names and IDs are not added as extra directories.
+- The output root can be set once as an application default in Settings or overridden per Batch. Each queue task snapshots the effective root when it is added.
 
 ### Core domain and configuration
 
@@ -115,6 +117,7 @@ Thumbnail handling is independent of video rendering. Auto mode downloads the ac
 - A Channel is a reusable profile. It can own defaults and share asset or preset groups with other channels.
 - A Batch contains jobs from any number of channels. Each Video job has an explicit channel before it is ready.
 - Configuration precedence is job override, batch override, channel default, then application default.
+- Output-root precedence is Batch override, then application default; when neither exists, ask once and save the choice to that Batch.
 - When a batch is confirmed, each job stores a snapshot of its selected assets and profiles. Editing a channel later does not silently mutate a confirmed or completed job.
 
 ### Channel profiles
@@ -155,22 +158,28 @@ The app can create, edit, duplicate, hide, and delete profiles. Deleting a profi
 ### Subtitle source and selection
 
 - Inspect available YouTube subtitle tracks without downloading the full source video.
-- For each language in the channel/job preference list, prefer a creator-provided track; use an automatic YouTube track only if no creator track is available for that language.
+- Use job overrides first, then the Channel's ordered subtitle preferences; if neither is set, use the video's language reported by yt-dlp.
+- For each preferred language, prefer a creator-provided track; use an automatic YouTube track only if no creator track is available for that language.
 - Continue to the next preferred language when neither track type is available for the current language.
-- Do not silently choose a YouTube subtitle in a language outside the configured preference list.
+- Do not silently choose a YouTube subtitle outside the configured preferences or the detected video-language fallback.
 - If no matching YouTube track exists, the job enters a needs-subtitle decision state. The user may attach an SRT/VTT file or choose Skip captions.
 - A supplied file is a fallback when YouTube has no matching preferred-language track. If a matching YouTube track exists, the app uses that YouTube track.
 - Do not generate subtitles with Whisper in the MVP.
 - Normalize selected timed captions for the render pipeline and create an SRT sidecar. Preserve the original downloaded or supplied subtitle artifact as a source artifact when configured.
+- For YouTube VTT tracks with inline word timestamps, remove karaoke markup and roll-up duplicates while preserving the ordered word sequence. Group timed words into readable SRT cues; a character-limit split is allowed only after the current cue has at least 1.2 seconds, so words sharing a timestamp cannot create overlapping flash cues. Non-karaoke timed SRT/VTT cues keep their source timing.
 - Store selected language, origin (creator, automatic, or supplied file), and caption decision in the job snapshot.
 - Subtitle timing remains aligned because the complete source audio is kept. Any later trim or offset feature must transform subtitle timing as well.
 
 ### Subtitle appearance and preview
 
-- A Subtitle preset controls font family, size, text color, background enable/color/opacity, outline, shadow, alignment, horizontal and vertical placement, safe margins, line spacing, and maximum line width/line count.
+- A Subtitle preset controls installed font family, bold, size, text color, background enable/color/opacity, outline/box width, shadow offset, nine-point anchor alignment, and horizontal/vertical position.
+- A shared Subtitle preset is a reusable library item; it is not automatically active. Each job uses its explicit preset override, then its Channel's default preset, then the built-in default. A shared preset can be selected as a Channel default or as a per-job override.
+- The font dropdown lists installed font families. A saved font that is unavailable on the current machine remains visible with a warning because the renderer may substitute a fallback.
+- Reset restores the built-in style values in the editor; the user must save to persist them.
 - Provide an editable demo string in a static frame preview. The preview does not require a video or timeline.
-- The preview frame follows the selected output frame shape. Font size and placement are interpreted against the selected output profile.
+- The preview supports multi-line text, selectable aspect ratios, and a 720-based reference frame. Position percentages locate the ASS anchor; center-middle uses the center of the entire caption block, so wrapping a long caption must not move that anchor. For a different render resolution, pixel-sized font and outline settings may have a different relative size.
 - Use the same subtitle rendering rules as the final render where practical. FFmpeg burns captions through its subtitles/libass path; the runtime must check that the packaged FFmpeg includes required subtitle support.
+- Use ASS automatic smart wrapping (WrapStyle 0) with 6% horizontal margins. Background-enabled styles use an opaque box whose width control is padding; background-disabled styles use that width as a glyph outline. Convert FFprobe JSON stdout as UTF-8 so Unicode media paths on Windows remain readable.
 - Support Unicode and Vietnamese text. Warn about missing fonts and show the fallback font used.
 - Store style in a reusable preset and convert it to an FFmpeg-compatible subtitle style for final rendering.
 
@@ -247,6 +256,7 @@ Thumbnail states:
 - Queue concurrency defaults to one active job and can be changed from 1 to 4. The scheduler updates its limit while running; a single Video job cannot run both its video and thumbnail pipelines at the same time.
 - A job failure does not prevent unrelated jobs from running.
 - On app restart, mark active subprocess work interrupted. Keep confirmed assignments and artifacts; let the user resume or retry from the last valid stage.
+- Deleting a Batch requires confirmation, is blocked while any job is actively running, removes its local history, and never deletes downloaded output files.
 - Re-running an already completed step must not redownload or rerender valid artifacts unless the user explicitly requests it.
 
 ### Output artifacts and local data

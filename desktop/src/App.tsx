@@ -225,11 +225,12 @@ function App() {
   }, [startupRetry]);
 
   useEffect(() => {
+    if (!startupReady) return;
     const sendHeartbeat = () => { void workerRequest("queue.heartbeat").catch(() => undefined); };
     sendHeartbeat();
     const timer = window.setInterval(sendHeartbeat, 4000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [startupReady]);
 
   if (!startupReady) {
     return <StartupSplash stage={startupStage} error={startupError} onRetry={() => setStartupRetry((value) => value + 1)} />;

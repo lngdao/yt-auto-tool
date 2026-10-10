@@ -11,8 +11,8 @@
 .style-scope-row,.style-preset-row { display:grid; grid-template-columns:1fr 1fr; gap:9px; margin-bottom:12px; }
 .style-preset-row { grid-template-columns:1fr auto; align-items:end; }
 .style-scope-row label,.style-preset-row label,.style-field { display:grid; gap:6px; color:#758077; font-size:9px; font-weight:650; }
-.style-scope-row select,.style-preset-row select,.style-field input:not([type=range]):not([type=color]),.style-field select { width:100%; height:34px; padding:0 9px; border:1px solid #e1e6de; border-radius:6px; color:#46534a; background:#fff; font-size:10px; outline:none; }
-.style-scope-row select:focus,.style-preset-row select:focus,.style-field input:focus,.style-field select:focus { border-color:#aac491; box-shadow:0 0 0 3px #e4efdc; }
+.style-scope-row select,.style-preset-row select,.style-field input:not([type=range]):not([type=color]),.style-field select,.style-field textarea { width:100%; min-height:34px; padding:0 9px; border:1px solid #e1e6de; border-radius:6px; color:#46534a; background:#fff; font-size:10px; outline:none; }
+.style-scope-row select:focus,.style-preset-row select:focus,.style-field input:focus,.style-field select:focus,.style-field textarea:focus { border-color:#aac491; box-shadow:0 0 0 3px #e4efdc; }
 .style-preset-row .button { height:34px; font-size:9px; }
 .default-preset-note { margin:2px 0 13px; padding:8px 10px; border:1px solid #e5eadf; border-radius:6px; color:#879188; background:#f6f8f3; font-size:9px; }
 .default-preset-note strong,.default-preset-note span { color:#688551; }
@@ -24,17 +24,19 @@
 .style-field input[type=range] { width:100%; height:15px; margin:0; accent-color:#829e67; }
 .style-field.color-control { display:flex; align-items:center; flex-wrap:wrap; min-height:47px; }
 .style-field.color-control input[type=color] { width:27px; height:24px; padding:2px; border:1px solid #e1e6de; border-radius:5px; background:#fff; }
+.style-field.color-control input[type=color]:disabled { opacity:.5; cursor:not-allowed; }
 .style-field.color-control code { color:#9ba49b; font-size:8px; }
+.style-field.color-control small { flex-basis:100%; }
 .style-check { display:flex; align-items:center; gap:7px; margin-bottom:12px; color:#78847a; font-size:9px; }
 .style-check input { accent-color:#829e67; }
 .style-editor-actions { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:7px; padding-top:12px; border-top:1px solid #edf0eb; }
 .style-editor-actions .button { height:34px; font-size:9px; }
 .caption-preview-stage { overflow:hidden; border:1px solid #343e36; border-radius:8px; background:#14201c; }
-.caption-preview-scene { position:relative; overflow:hidden; aspect-ratio:16/9; background:radial-gradient(ellipse at 64% 43%,#9aa880 0,#61715d 24%,transparent 57%),linear-gradient(180deg,#3a514a 0%,#24372f 59%,#19261f 60%,#26352a 100%); }
+.caption-preview-scene { position:relative; overflow:hidden; aspect-ratio:16/9; container-type:inline-size; background:radial-gradient(ellipse at 64% 43%,#9aa880 0,#61715d 24%,transparent 57%),linear-gradient(180deg,#3a514a 0%,#24372f 59%,#19261f 60%,#26352a 100%); }
 .caption-preview-scene::before { position:absolute; inset:0; content:""; opacity:.18; background:linear-gradient(165deg,transparent 40%,#101a14 40.3%,transparent 63%),linear-gradient(20deg,transparent 46%,#d0bd81 46.2%,transparent 70%); }
 .caption-preview-horizon { position:absolute; right:-7%; bottom:-20%; left:-5%; height:48%; border-radius:50% 50% 0 0; background:linear-gradient(160deg,#526249,#25362b 65%); transform:rotate(-3deg); }
 .caption-preview-light { position:absolute; top:20%; left:27%; width:17%; aspect-ratio:1; border-radius:50%; background:#e9dba159; filter:blur(30px); }
-.caption-preview-text { position:absolute; z-index:1; max-width:88%; padding:.18em .38em; border-radius:.16em; line-height:1.15; text-align:center; white-space:normal; font-weight:700; paint-order:stroke fill; }
+.caption-preview-text { position:absolute; z-index:1; max-width:88%; line-height:1.15; white-space:pre-wrap; font-weight:400; paint-order:stroke fill; }
 .caption-preview-caption { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:9px 10px; background:#202b25; }
 .caption-preview-caption span { color:#c0d0bd; font-size:7px; font-weight:750; letter-spacing:1px; }
 .caption-preview-caption small { color:#77877b; font-size:7px; text-align:right; }

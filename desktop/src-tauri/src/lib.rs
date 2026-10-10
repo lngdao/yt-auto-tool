@@ -4,6 +4,25 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn tesseract_data_directory(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path_text = path.to_string_lossy();
+        if let Some(unprefixed) = path_text.strip_prefix("\\\\?\\") {
+            if let Some(unc_path) = unprefixed.strip_prefix("UNC\\") {
+                return PathBuf::from(format!("\\\\{unc_path}"));
+            }
+            return PathBuf::from(unprefixed);
+        }
+    }
+    path.to_path_buf()
+}
 
 fn app_data_tool(app_tools: &Path, tool_name: &str) -> Option<PathBuf> {
     let metadata = std::fs::read_to_string(app_tools.join(format!("{tool_name}.json"))).ok()?;
@@ -141,13 +160,18 @@ async fn worker_request(
                 }
             }
             let app_tessdata = data_dir.join("tessdata");
-            let tessdata = if app_tessdata.is_dir() {
+            let app_tessdata_has_models = ["eng", "vie"].iter().any(|language| {
+                app_tessdata
+                    .join(format!("{language}.traineddata"))
+                    .is_file()
+            });
+            let tessdata = if app_tessdata_has_models {
                 app_tessdata
             } else {
                 tool_directory.join("tessdata")
             };
             if tessdata.is_dir() {
-                command.env("TESSDATA_DIR", tessdata);
+                command.env("TESSDATA_DIR", tesseract_data_directory(&tessdata));
             }
         } else {
             let app_tools = data_dir.join("tools");
@@ -164,6 +188,9 @@ async fn worker_request(
                 }
             }
         }
+
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
 
         let mut child = command
             .stdin(Stdio::piped())
